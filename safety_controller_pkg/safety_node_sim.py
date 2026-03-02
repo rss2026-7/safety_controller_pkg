@@ -12,8 +12,8 @@ class SafetyNode(Node):
         super().__init__('safety_node')
         self.SAFE_DISTANCE = 1
         
-        # self.breach_pub = self.create_publisher(Bool, "/safety_breach", 10)
-        self.drive_pub = self.create_publisher(AckermannDriveStamped, "/vesc/low_level/input/safety", 10)
+        self.breach_pub = self.create_publisher(Bool, "/safety_breach", 10)
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", 10)
         self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
     def scan_callback(self, msg):
         ranges = np.array(msg.ranges)
@@ -32,7 +32,7 @@ class SafetyNode(Node):
         # 3. Create and publish the message ONCE
         breach_msg = Bool()
         breach_msg.data = collision_detected
-        # self.breach_pub.publish(breach_msg)
+        self.breach_pub.publish(breach_msg)
 
         # 4. Trigger the stop command if true
         if collision_detected:
