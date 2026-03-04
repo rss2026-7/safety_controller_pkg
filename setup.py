@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'safety_controller_pkg = safety_controller_pkg.safety_node:main',
+            'example_forward = safety_controller_pkg.example_forward:main',
         ],
     },
 )
