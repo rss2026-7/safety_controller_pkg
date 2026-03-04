@@ -23,6 +23,10 @@ class SafetyNode(Node):
         super().__init__('safety_node')
         self.SAFE_DISTANCE = 0.4  # meters
         self.CONE_HALF_ANGLE = 2.007  # 115 deg → 230 deg total
+        self.LASER_TIMEOUT = 0.5  # seconds without a scan → laser disconnected
+
+        self.last_scan_time = None
+        self.laser_disconnected = False
 
         # Safety stop overrides navigation via the low-level mux
         self.safety_pub = self.create_publisher(
@@ -30,13 +34,33 @@ class SafetyNode(Node):
         )
         self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
 
+        # Periodically check whether laser messages are still arriving
+        self.create_timer(0.1, self.check_laser_timeout)
+
         self.get_logger().info(
             'SafetyNode started — publishing stop commands to '
             '/vesc/low_level/input/safety when obstacles < '
             f'{self.SAFE_DISTANCE}m'
         )
 
+    def check_laser_timeout(self):
+        if self.last_scan_time is None:
+            return  # haven't received any scan yet — still starting up
+        elapsed = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
+        if elapsed > self.LASER_TIMEOUT:
+            if not self.laser_disconnected:
+                self.laser_disconnected = True
+                self.get_logger().error(
+                    '\033[91mLASER DISCONNECTED — no /scan messages for '
+                    f'{elapsed:.2f}s — STOPPING ROBOT\033[0m'
+                )
+            self.send_stop_command()
+        elif self.laser_disconnected:
+            self.laser_disconnected = False
+            self.get_logger().info('\033[92mLaser reconnected\033[0m')
+
     def scan_callback(self, msg):
+        self.last_scan_time = self.get_clock().now()
         ranges = np.array(msg.ranges)
         angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
 
