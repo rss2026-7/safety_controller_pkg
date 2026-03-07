@@ -21,12 +21,13 @@ class SafetyNode(Node):
 
     def __init__(self):
         super().__init__('safety_node')
-        self.SAFE_DISTANCE = 0.4  # meters
+        self.SAFE_DISTANCE = 0.25  # meters
         self.CONE_HALF_ANGLE = 2.007  # 115 deg → 230 deg total
         self.LASER_TIMEOUT = 0.5  # seconds without a scan → laser disconnected
 
         self.last_scan_time = None
         self.laser_disconnected = False
+        self.startup_time = self.get_clock().now()
 
         # Safety stop overrides navigation via the low-level mux
         self.safety_pub = self.create_publisher(
@@ -44,9 +45,13 @@ class SafetyNode(Node):
         )
 
     def check_laser_timeout(self):
+        now = self.get_clock().now()
         if self.last_scan_time is None:
-            return  # haven't received any scan yet — still starting up
-        elapsed = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
+            elapsed = (now - self.startup_time).nanoseconds / 1e9
+            if elapsed <= self.LASER_TIMEOUT:
+                return  # grace period — still starting up
+        else:
+            elapsed = (now - self.last_scan_time).nanoseconds / 1e9
         if elapsed > self.LASER_TIMEOUT:
             if not self.laser_disconnected:
                 self.laser_disconnected = True
@@ -77,9 +82,17 @@ class SafetyNode(Node):
         min_dist = np.min(front_ranges)
         if min_dist < self.SAFE_DISTANCE:
             self.get_logger().warn(
-                f'OBSTACLE at {min_dist:.3f}m — braking!'
+                f'\033[93mOBSTACLE at {min_dist:.3f}m — braking!\033[0m'
             )
             self.send_stop_command()
+        elif min_dist < self.SAFE_DISTANCE * 2:
+            self.get_logger().info(
+                f'\033[93mWall distance: {min_dist:.3f}m\033[0m'
+            )
+        else:
+            self.get_logger().info(
+                f'\033[97mWall distance: {min_dist:.3f}m\033[0m'
+            )
 
     def send_stop_command(self):
         stop = AckermannDriveStamped()
