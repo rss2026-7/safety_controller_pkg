@@ -68,4 +68,4 @@ On every commit:
    git tag -a v2.1.0 -m "Release v2.1.0"
    ```
 
-Current version: **2.3.0**
+Current version: **2.3.1**

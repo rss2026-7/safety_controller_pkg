@@ -2,6 +2,8 @@
 
 Advanced ROS 2 safety controller for MIT RACECAR, specifically designed for **Final Challenge 2026**.
 
+![Demo](.github/demo.gif)
+
 ## What Changed from v1.0
 
 ### Old Behavior (v1.0)
