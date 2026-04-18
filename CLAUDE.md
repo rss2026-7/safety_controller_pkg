@@ -8,53 +8,64 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build (from racecar_ws)
 cd ~/racecar_ws && colcon build --packages-select safety_controller_pkg && source install/setup.bash
 
-# Run safety node (physical car or with racecar_simulator)
+# Run safety node - city mode (default, for Part B)
 ros2 run safety_controller_pkg safety_controller_pkg
 
-# Run example drive node (test safety override)
-ros2 run safety_controller_pkg example_forward
+# Run safety node - race mode (for Part A)
+ros2 run safety_controller_pkg safety_controller_pkg --ros-args -p mode:=race
 
 # Run standalone 2D simulator (no ROS required)
 python3 -m safety_controller_pkg.basic_sim.run_sim
+python3 -m safety_controller_pkg.basic_sim.run_sim --mode race
 ```
 
 ## Architecture
 
-ROS 2 Python package for MIT RACECAR safety. Uses the VESC mux architecture:
+ROS 2 Python package for MIT RACECAR safety. Designed for **Final Challenge 2026**.
 
-- **SafetyNode** subscribes to `/scan` (LaserScan), publishes stop commands to `/vesc/low_level/input/safety`
-- **Navigation nodes** (wall follower, example_forward) publish to `/vesc/high_level/input/nav_*`
-- Low-level mux prioritizes safety channel — when SafetyNode publishes a stop, it overrides navigation
+### v2.0 Key Features
+- **Velocity-dependent stopping distance**: `d = v²/(2a) + margin` — at 4 m/s needs ~1.5m, not 0.25m
+- **Dynamic cone angle**: Narrows from 172° to 46° as speed increases (prevents adjacent lane false triggers)
+- **Graduated response**: CLEAR → CAUTION (speed limited) → DANGER (stop)
+- **External override interface**: `/safety/external_stop` and `/safety/max_speed` for Part B integration
+- **Race vs City modes**: Race mode ignores external overrides, uses steering-aware detection
 
-SafetyNode is passive when no obstacle detected (publishes nothing, letting nav commands pass through). It only publishes stop commands, never drive commands.
+### Topics
+- **Subscribes**: `/scan`, `/odom`, `/vesc/odom`, `/safety/external_stop`, `/safety/max_speed`
+- **Publishes**: `/vesc/low_level/input/safety`, `/safety/status`
+
+### VESC Mux
+- **SafetyNode** publishes to `/vesc/low_level/input/safety` (high priority)
+- **Nav nodes** publish to `/vesc/high_level/input/nav_*` (lower priority)
+- Low-level mux prioritizes safety channel
 
 ## Safety Parameters (safety_node.py)
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| SAFE_DISTANCE | 0.25m | Braking threshold |
-| CONE_HALF_ANGLE | 2.007 rad (115°) | Half of 230° front scan cone |
-| LASER_TIMEOUT | 0.5s | Stop if no /scan messages received |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| mode | city | `race` or `city` |
+| brake_accel | 6.0 | Braking deceleration (m/s²) |
+| min_distance | 0.20 | Minimum stopping threshold (m) |
+| max_cone_angle | 1.5 | Cone half-angle at 0 speed (rad) |
+| min_cone_angle | 0.4 | Cone half-angle at max speed (rad) |
+| laser_timeout | 0.5 | Emergency stop if no /scan (s) |
 
 ## basic_sim/
 
-Standalone pygame simulator that runs the **real** safety_node.py unchanged via mocked ROS interfaces (ros_mock.py). Use for visual debugging without full ROS stack.
+Standalone pygame simulator that runs the **real** safety_node.py via mocked ROS interfaces.
 
-Controls: WASD=drive, Space=brake, R=reset, M=toggle lidar rays, Esc=quit
+Controls: WASD=drive, Space=brake, R=reset, M=toggle lidar, E=external stop, Q=speed limit, Esc=quit
 
 ## Versioning
 
 On every commit:
-1. Bump the patch version (e.g., `1.0.0` → `1.0.1`) in these files:
+1. Bump the patch version (e.g., `2.0.0` → `2.0.1`) in these files:
    - `setup.py` (version parameter)
    - `package.xml` (version element)
 
-2. When the minor version changes (e.g., `1.0.x` → `1.1.0`), also create a git tag:
+2. When the minor version changes (e.g., `2.0.x` → `2.1.0`), also create a git tag:
    ```
-   git tag -a v1.1.0 -m "Release v1.1.0"
+   git tag -a v2.1.0 -m "Release v2.1.0"
    ```
 
-Version format: `MAJOR.MINOR.PATCH` (semantic versioning)
-- PATCH: bug fixes, small changes (auto-bump on every commit)
-- MINOR: new features, significant changes (manual bump, triggers git tag)
-- MAJOR: breaking changes (manual bump, triggers git tag)
+Current version: **2.3.0**

@@ -3,7 +3,10 @@
 The real safety node imports:
     import rclpy
     from rclpy.node import Node
+    from rclpy.parameter import Parameter
     from sensor_msgs.msg import LaserScan
+    from nav_msgs.msg import Odometry
+    from std_msgs.msg import Bool, Float32
     from ackermann_msgs.msg import AckermannDriveStamped
 
 We install fake modules for all of these into sys.modules BEFORE the safety
@@ -13,11 +16,11 @@ implementations.
 The mock provides:
   * `rclpy.init / spin / shutdown` (spin is a no-op — our sim loop drives time)
   * `rclpy.node.Node` with create_publisher / create_subscription /
-    create_timer / get_clock / get_logger
+    create_timer / get_clock / get_logger / declare_parameter / get_parameter
   * In-process pub/sub: publishing to a topic synchronously invokes every
     subscriber callback
   * A manually-advanced clock so we can control "now" from the sim loop
-  * LaserScan and AckermannDriveStamped dataclass-style stand-ins
+  * LaserScan, Odometry, Bool, Float32, AckermannDriveStamped dataclass-style stand-ins
 
 This is NOT a full rclpy implementation — it has only what safety_node.py
 and a simple driver publisher actually need.
@@ -116,6 +119,20 @@ class _MockClock:
 
 
 # --------------------------------------------------------------------------
+# Parameter mock — stores parameter values for declare_parameter/get_parameter
+# --------------------------------------------------------------------------
+class Parameter:
+    """Mock rclpy.parameter.Parameter for type hints."""
+    pass
+
+
+class _ParameterValue:
+    """Mock parameter value with .value attribute."""
+    def __init__(self, value: Any):
+        self.value = value
+
+
+# --------------------------------------------------------------------------
 # Logger — prints with node name + severity tag. Colors are kept intact
 # since safety_node.py embeds ANSI escapes.
 # --------------------------------------------------------------------------
@@ -192,6 +209,7 @@ class Node:
         self._node_name = node_name
         self._logger = _Logger(node_name)
         self._clock = _MockClock()
+        self._parameters: dict[str, Any] = {}
 
     def get_logger(self) -> _Logger:
         return self._logger
@@ -215,6 +233,15 @@ class Node:
         t = _Timer(period=period, callback=cb)
         TIMERS.append(t)
         return t
+
+    def declare_parameter(self, name: str, default_value: Any) -> _ParameterValue:
+        """Mock declare_parameter - stores the default value."""
+        self._parameters[name] = default_value
+        return _ParameterValue(default_value)
+
+    def get_parameter(self, name: str) -> _ParameterValue:
+        """Mock get_parameter - returns stored value."""
+        return _ParameterValue(self._parameters.get(name))
 
 
 # --------------------------------------------------------------------------
@@ -283,6 +310,86 @@ class AckermannDriveStamped:
 
 
 # --------------------------------------------------------------------------
+# Additional message types for v2.0 safety controller
+# --------------------------------------------------------------------------
+@dataclass
+class _Twist:
+    """geometry_msgs/Twist component for Odometry."""
+    linear: Any = None
+    angular: Any = None
+
+    def __post_init__(self):
+        if self.linear is None:
+            self.linear = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        if self.angular is None:
+            self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+
+@dataclass
+class _TwistWithCovariance:
+    """geometry_msgs/TwistWithCovariance for Odometry."""
+    twist: _Twist = None
+    covariance: list = field(default_factory=lambda: [0.0] * 36)
+
+    def __post_init__(self):
+        if self.twist is None:
+            self.twist = _Twist()
+
+
+@dataclass
+class _Pose:
+    """geometry_msgs/Pose component for Odometry."""
+    position: Any = None
+    orientation: Any = None
+
+    def __post_init__(self):
+        if self.position is None:
+            self.position = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        if self.orientation is None:
+            self.orientation = types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+
+
+@dataclass
+class _PoseWithCovariance:
+    """geometry_msgs/PoseWithCovariance for Odometry."""
+    pose: _Pose = None
+    covariance: list = field(default_factory=lambda: [0.0] * 36)
+
+    def __post_init__(self):
+        if self.pose is None:
+            self.pose = _Pose()
+
+
+@dataclass
+class Odometry:
+    """nav_msgs/Odometry — used by safety node to get current velocity."""
+    header: _Header = None
+    child_frame_id: str = ""
+    pose: _PoseWithCovariance = None
+    twist: _TwistWithCovariance = None
+
+    def __post_init__(self):
+        if self.header is None:
+            self.header = _Header()
+        if self.pose is None:
+            self.pose = _PoseWithCovariance()
+        if self.twist is None:
+            self.twist = _TwistWithCovariance()
+
+
+@dataclass
+class Bool:
+    """std_msgs/Bool — used for external stop requests."""
+    data: bool = False
+
+
+@dataclass
+class Float32:
+    """std_msgs/Float32 — used for speed limits and status."""
+    data: float = 0.0
+
+
+# --------------------------------------------------------------------------
 # Install into sys.modules so `import rclpy` etc. Just Works.
 # --------------------------------------------------------------------------
 def install() -> None:
@@ -301,11 +408,29 @@ def install() -> None:
     rclpy_node_mod.Node = Node
     rclpy_mod.node = rclpy_node_mod
 
+    # rclpy.parameter submodule
+    rclpy_parameter_mod = types.ModuleType("rclpy.parameter")
+    rclpy_parameter_mod.Parameter = Parameter
+    rclpy_mod.parameter = rclpy_parameter_mod
+
     # sensor_msgs package + .msg submodule
     sensor_msgs_mod = types.ModuleType("sensor_msgs")
     sensor_msgs_msg_mod = types.ModuleType("sensor_msgs.msg")
     sensor_msgs_msg_mod.LaserScan = LaserScan
     sensor_msgs_mod.msg = sensor_msgs_msg_mod
+
+    # nav_msgs package + .msg submodule
+    nav_msgs_mod = types.ModuleType("nav_msgs")
+    nav_msgs_msg_mod = types.ModuleType("nav_msgs.msg")
+    nav_msgs_msg_mod.Odometry = Odometry
+    nav_msgs_mod.msg = nav_msgs_msg_mod
+
+    # std_msgs package + .msg submodule
+    std_msgs_mod = types.ModuleType("std_msgs")
+    std_msgs_msg_mod = types.ModuleType("std_msgs.msg")
+    std_msgs_msg_mod.Bool = Bool
+    std_msgs_msg_mod.Float32 = Float32
+    std_msgs_mod.msg = std_msgs_msg_mod
 
     # ackermann_msgs package + .msg submodule
     ackermann_msgs_mod = types.ModuleType("ackermann_msgs")
@@ -315,8 +440,13 @@ def install() -> None:
 
     sys.modules["rclpy"] = rclpy_mod
     sys.modules["rclpy.node"] = rclpy_node_mod
+    sys.modules["rclpy.parameter"] = rclpy_parameter_mod
     sys.modules["sensor_msgs"] = sensor_msgs_mod
     sys.modules["sensor_msgs.msg"] = sensor_msgs_msg_mod
+    sys.modules["nav_msgs"] = nav_msgs_mod
+    sys.modules["nav_msgs.msg"] = nav_msgs_msg_mod
+    sys.modules["std_msgs"] = std_msgs_mod
+    sys.modules["std_msgs.msg"] = std_msgs_msg_mod
     sys.modules["ackermann_msgs"] = ackermann_msgs_mod
     sys.modules["ackermann_msgs.msg"] = ackermann_msgs_msg_mod
 

@@ -4,7 +4,7 @@ package_name = 'safety_controller_pkg'
 
 setup(
     name=package_name,
-    version='1.0.0',
+    version='2.3.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -15,8 +15,8 @@ setup(
     zip_safe=True,
     maintainer='racecar',
     maintainer_email='racecar@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Advanced safety controller with velocity-dependent braking for Final Challenge 2026',
+    license='MIT',
     extras_require={
         'test': [
             'pytest',

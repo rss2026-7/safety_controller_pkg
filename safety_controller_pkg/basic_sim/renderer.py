@@ -115,6 +115,8 @@ class Renderer:
         safe_distance: float,
         cone_half_angle: float,
         braking: bool,
+        critical_distance: float = 0.15,
+        zone: int = 0,
     ) -> None:
         """Translucent pie showing what the safety node is watching."""
         lx, ly = state.laser_xy(car_params)
@@ -123,8 +125,15 @@ class Renderer:
         if radius_px < 4:
             return
 
-        # 230-deg cone as a polygon
-        color = SAFETY_CONE_WARN if braking else SAFETY_CONE_OK
+        # Zone colors
+        ZONE_COLORS = {
+            0: SAFETY_CONE_OK,                    # CLEAR - green
+            1: (220, 180, 40, 70),                # CAUTION - yellow
+            2: SAFETY_CONE_WARN,                  # DANGER - red
+            3: (255, 0, 255, 100),                # CRITICAL - magenta (pulsing)
+        }
+        color = ZONE_COLORS.get(zone, SAFETY_CONE_OK)
+
         cone_surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         pts = [(sx, sy)]
         n = 30
@@ -135,9 +144,18 @@ class Renderer:
             pts.append((px, py))
         pygame.draw.polygon(cone_surface, color, pts)
 
-        # Inner stop-radius circle (0.25 m)
+        # Danger zone circle (stopping distance)
         inner_r = int(safe_distance * self.camera.zoom)
         pygame.draw.circle(cone_surface, SAFETY_RADIUS, (sx, sy), inner_r)
+
+        # CRITICAL zone circle (0.15m) - bright red/magenta, always visible
+        critical_r = int(critical_distance * self.camera.zoom)
+        critical_color = (255, 0, 100, 120) if zone == 3 else (200, 0, 80, 60)
+        pygame.draw.circle(cone_surface, critical_color, (sx, sy), critical_r)
+
+        # Draw critical zone border
+        pygame.draw.circle(cone_surface, (255, 0, 100, 200), (sx, sy), critical_r, 2)
+
         self.screen.blit(cone_surface, (0, 0))
 
     def draw_lidar(
@@ -245,6 +263,88 @@ class Renderer:
         help_lines = [
             "W/S: throttle   A/D: steer   Space: handbrake",
             "R: reset pose   M: toggle lidar rays   Esc: quit",
+        ]
+        for i, text in enumerate(help_lines):
+            surf = self.font.render(text, True, TEXT)
+            self.screen.blit(surf, (12, self.height - 40 + 18 * i))
+
+    def draw_hud_v2(
+        self,
+        state: CarState,
+        throttle: float,
+        min_front_dist: float,
+        safety_active: bool,
+        nav_speed_cmd: float,
+        fps: float,
+        stopping_dist: float,
+        cone_angle: float,
+        zone_name: str,
+        external_stop: bool,
+        speed_limit: float | None,
+    ) -> None:
+        """Enhanced HUD for v2.0 safety controller with dynamic parameters."""
+
+        # Zone colors
+        zone_colors = {
+            "CLEAR": (60, 160, 90),
+            "CAUTION": (220, 180, 40),
+            "DANGER": (220, 60, 60),
+            "CRITICAL": (180, 30, 180),
+        }
+        zone_color = zone_colors.get(zone_name, (100, 100, 100))
+
+        # Left panel: Vehicle state
+        lines = [
+            f"Speed       : {state.speed:+.2f} m/s",
+            f"Steering    : {math.degrees(state.steering):+.1f} deg",
+            f"Throttle    : {throttle:+.2f}  (nav: {nav_speed_cmd:+.2f} m/s)",
+            f"Pose        : ({state.x:+.2f}, {state.y:+.2f}) θ={math.degrees(state.theta):+.1f}°",
+            "",
+            f"Min front   : {min_front_dist:.2f} m",
+            f"Stop dist   : {stopping_dist:.2f} m (dynamic)",
+            f"Cone angle  : {math.degrees(cone_angle):.0f}° (dynamic)",
+            "",
+            f"FPS         : {fps:.0f}",
+        ]
+        for i, text in enumerate(lines):
+            color = TEXT if text else TEXT
+            surf = self.font.render(text, True, color)
+            self.screen.blit(surf, (12, 10 + 18 * i))
+
+        # Top-right: Safety zone banner
+        banner = f"  {zone_name}  "
+        surf = self.font_big.render(banner, True, (255, 255, 255))
+        bg = pygame.Surface((surf.get_width() + 16, surf.get_height() + 8))
+        bg.fill(zone_color)
+        bg.blit(surf, (8, 4))
+        self.screen.blit(bg, (self.width - bg.get_width() - 12, 10))
+
+        # Second row: Override status
+        y_offset = 50
+        if safety_active:
+            msg = "SAFETY OVERRIDE ACTIVE"
+            color = (220, 60, 60)
+        else:
+            msg = "Nav control active"
+            color = (60, 160, 90)
+        surf = self.font.render(msg, True, color)
+        self.screen.blit(surf, (self.width - surf.get_width() - 20, y_offset))
+
+        # Third row: External overrides
+        y_offset = 75
+        if external_stop:
+            surf = self.font.render("EXT STOP (E)", True, (180, 30, 180))
+            self.screen.blit(surf, (self.width - surf.get_width() - 20, y_offset))
+            y_offset += 20
+
+        if speed_limit is not None:
+            surf = self.font.render(f"LIMIT: {speed_limit:.1f} m/s (Q)", True, (220, 140, 40))
+            self.screen.blit(surf, (self.width - surf.get_width() - 20, y_offset))
+
+        # Bottom help
+        help_lines = [
+            "W/S: throttle   A/D: steer   Space: brake   R: reset",
+            "M: lidar rays   E: ext stop   Q: speed limit   Esc: quit",
         ]
         for i, text in enumerate(help_lines):
             surf = self.font.render(text, True, TEXT)
