@@ -17,7 +17,8 @@ from ackermann_msgs.msg import AckermannDriveStamped
 class ExampleForward(Node):
     def __init__(self):
         super().__init__('example_forward')
-        self.SPEED = 1.0  # m/s
+        self.declare_parameter('speed', 1.0)
+        self.SPEED = float(self.get_parameter('speed').value)  # m/s
 
         self.nav_pub = self.create_publisher(
             AckermannDriveStamped, "/vesc/high_level/input/nav_0", 10

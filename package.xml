@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>safety_controller_pkg</name>
-  <version>2.3.2</version>
+  <version>2.4.0</version>
   <description>Advanced safety controller with velocity-dependent braking for Final Challenge 2026</description>
   <maintainer email="racecar@todo.todo">racecar</maintainer>
   <license>MIT</license>

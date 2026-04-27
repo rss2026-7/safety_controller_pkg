@@ -2,25 +2,27 @@
 """
 Advanced Safety Controller for MIT RACECAR
 
-Designed for Final Challenge 2026:
-  - Part A (Race): Velocity-dependent braking, narrow dynamic cone, lane-aware
-  - Part B (Boating School): Graduated response, external overrides, reversing support
+All tunables live in a single YAML config (``config/safety.yaml``) — there
+are NO code-side defaults. The node refuses to start if any required key
+is missing.
 
-Key improvements over basic safety controller:
+Key features:
   1. Velocity-dependent stopping distance (physics-based)
   2. Dynamic cone angle that narrows at high speed
-  3. Steering-aware obstacle weighting
-  4. Direction-aware scanning (forward/reverse)
-  5. Graduated response zones (CLEAR/CAUTION/AVOIDANCE/CRITICAL)
-  6. External override interface for perception integration
-  7. Configurable modes (race vs city)
+  3. Steering-aware obstacle weighting (feature-flagged)
+  4. Direction-aware scanning (forward/reverse, feature-flagged)
+  5. Graduated response zones: CLEAR / CAUTION / AVOIDANCE / CRITICAL
+  6. External override interface for perception integration (feature-flagged)
 """
 
 import math
+import os
+import yaml
+
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 import numpy as np
+from ament_index_python.packages import get_package_share_directory
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
@@ -30,91 +32,87 @@ from ackermann_msgs.msg import AckermannDriveStamped
 
 class SafetyZone:
     """Safety zone classification for graduated response."""
-    CLEAR = 0      # No action needed, nav has full control
-    CAUTION = 1    # Reduce speed proportionally (scale factor 1.0 → 0.5)
-    AVOIDANCE = 2  # Speed-limited and actively steering away (factor 0.5 → 0.1)
-    CRITICAL = 3   # Already too close, maximum braking
+    CLEAR = 0      # No action; nav has full control
+    CAUTION = 1    # Speed scaled down linearly
+    AVOIDANCE = 2  # Speed-limited and actively steering away
+    CRITICAL = 3   # Already too close, hard brake
 
 
 class SafetyNode(Node):
-    """Advanced safety controller with velocity-aware braking and multiple modes.
-
-    Modes:
-        'race':  Narrow cone, high-speed optimized, ignores external overrides
-        'city':  Wide cone, graduated response, listens to perception systems
+    """Advanced safety controller. All behavior controlled by YAML config.
 
     Topics Subscribed:
         /scan                    - LaserScan for obstacle detection
-        /odom                    - Odometry for current velocity
-        /vesc/sensors/core       - VESC telemetry (backup velocity source)
-        /safety/external_stop    - Bool, external stop request (Part B)
-        /safety/max_speed        - Float32, external speed limit (Part B)
+        /odom, /vesc/odom        - Odometry for current velocity
+        /vesc/high_level/input/nav_0 - Nav drive commands (steering intent)
+        /safety/external_stop    - Bool, external stop request
+        /safety/max_speed        - Float32, external speed limit
 
     Topics Published:
-        /vesc/low_level/input/safety  - AckermannDriveStamped stop/slow commands
-        /safety/status                - Float32, current safety zone (for debugging)
-
-    Parameters:
-        mode           - 'race' or 'city' (default: 'city')
-        brake_accel    - Braking deceleration in m/s² (default: 6.0)
-        min_distance   - Minimum stopping distance in m (default: 0.20)
-        reaction_time  - Reaction time margin in seconds (default: 0.05)
-        max_cone_angle - Maximum half-cone angle in rad (default: 1.5, ~86°)
-        min_cone_angle - Minimum half-cone angle in rad (default: 0.4, ~23°)
-        caution_multiplier - Multiplier for caution zone (default: 2.0)
+        /vesc/low_level/input/safety - AckermannDriveStamped stop/limit
+        /safety/status               - Float32, current SafetyZone value
     """
 
     def __init__(self):
         super().__init__('safety_node')
 
-        # ===== Declare and get parameters =====
-        self.declare_parameter('mode', 'city')
-        self.declare_parameter('brake_accel', 6.0)
-        self.declare_parameter('min_distance', 0.35)        # CRITICAL threshold floor (m)
-        self.declare_parameter('reaction_time', 0.05)
-        self.declare_parameter('max_cone_angle', 1.5)
-        self.declare_parameter('min_cone_angle', 0.4)
-        self.declare_parameter('caution_multiplier', 2.857) # CAUTION = stopping × this (~1.0m at v=0)
-        self.declare_parameter('brake_speed', 0.0)          # Target speed during CRITICAL hard stop
-        self.declare_parameter('laser_timeout', 0.5)
-        self.declare_parameter('max_speed', 4.0)
-        self.declare_parameter('wheelbase', 0.325)
-        # Distance from LIDAR origin to the front bumper. The launched MIT
-        # racecar_simulator is a point car with no chassis or collision body,
-        # and its lidar sits 0.275m forward of base_link — so for the sim
-        # this offset is effectively zero. Override on the real car.
-        self.declare_parameter('lidar_to_bumper', 0.0)
-        self.declare_parameter('safety_buffer', 0.05)  # Margin beyond physics
-        self.declare_parameter('critical_avoidance_angle', math.radians(20.0))
+        # ===== Load the bundled YAML config (the ground truth) =====
+        # We load it directly so the package works with `ros2 run` as well
+        # as `ros2 launch`. ROS-level overrides (via `--params-file` or
+        # `-p key:=value`) still win — declare_parameter uses the YAML
+        # value as the *default*, and rclpy applies any override on top.
+        self._cfg = self._load_bundled_config()
 
-        self.mode = self.get_parameter('mode').value
-        self.brake_accel = self.get_parameter('brake_accel').value
-        self.min_distance = self.get_parameter('min_distance').value
-        self.reaction_time = self.get_parameter('reaction_time').value
-        self.max_cone_angle = self.get_parameter('max_cone_angle').value
-        self.min_cone_angle = self.get_parameter('min_cone_angle').value
-        self.caution_multiplier = self.get_parameter('caution_multiplier').value
-        self.laser_timeout = self.get_parameter('laser_timeout').value
-        self.max_speed = self.get_parameter('max_speed').value
-        self.wheelbase = self.get_parameter('wheelbase').value
-        self.lidar_to_bumper = self.get_parameter('lidar_to_bumper').value
-        self.safety_buffer = self.get_parameter('safety_buffer').value
-        self.brake_speed = self.get_parameter('brake_speed').value
-        self.critical_avoidance_angle = self.get_parameter('critical_avoidance_angle').value
+        # ===== Read every parameter, screaming on any missing key =====
+        self.cone_max_angle    = self._req('cone.max_angle')
+        self.cone_min_angle    = self._req('cone.min_angle')
+        self.cone_shrink_speed = self._req('cone.shrink_speed')
+
+        self.wheelbase       = self._req('vehicle.wheelbase')
+        self.lidar_to_bumper = self._req('vehicle.lidar_to_bumper')
+
+        self.brake_accel   = self._req('physics.brake_accel')
+        self.reaction_time = self._req('physics.reaction_time')
+        self.safety_buffer = self._req('physics.safety_buffer')
+
+        self.respect_external_stop    = self._req('features.respect_external_stop')
+        self.respect_external_speed   = self._req('features.respect_external_speed')
+        self.steering_aware_detection = self._req('features.steering_aware_detection')
+        self.reverse_scanning         = self._req('features.reverse_scanning')
+
+        self.caution_multiplier   = self._req('caution.distance_multiplier')
+        self.caution_start_factor = self._req('caution.start_factor')
+        self.caution_end_factor   = self._req('caution.end_factor')
+        self.caution_escalate     = self._req('caution.escalate_below_factor')
+
+        self.avoidance_enabled       = self._req('avoidance.enabled')
+        self.avoidance_max_steering  = self._req('avoidance.max_steering_angle')
+        head_on = self._req('avoidance.head_on_direction')
+        if head_on not in ('left', 'right'):
+            raise ValueError(
+                f"avoidance.head_on_direction must be 'left' or 'right', got {head_on!r}"
+            )
+        # Steering convention: positive = left turn.
+        self.head_on_sign = 1.0 if head_on == 'left' else -1.0
+
+        self.min_distance          = self._req('critical.min_distance')
+        self.brake_speed           = self._req('critical.brake_speed')
+        self.critical_steer_away   = self._req('critical.steer_away')
+        self.critical_max_steering = self._req('critical.max_steering_angle')
+
+        self.laser_timeout = self._req('laser_timeout')
 
         # ===== State variables =====
-        self.current_speed = 0.0          # m/s, from odometry
-        self.current_steering = 0.0       # rad, from nav drive commands
-        self.current_nav_speed = 0.0      # m/s, last commanded nav speed
+        self.current_speed = 0.0
+        self.current_steering = 0.0
+        self.current_nav_speed = 0.0
         self.last_scan_time = None
         self.laser_disconnected = False
         self.startup_time = self.get_clock().now()
 
-        # External override state (for Part B integration)
         self.external_stop_requested = False
         self.external_speed_limit = None  # None = no limit
 
-        # Current safety state
         self.current_zone = SafetyZone.CLEAR
         self.closest_obstacle_dist = float('inf')
         self.closest_obstacle_angle = 0.0
@@ -123,20 +121,14 @@ class SafetyNode(Node):
         self.safety_pub = self.create_publisher(
             AckermannDriveStamped, "/vesc/low_level/input/safety", 10
         )
-        self.status_pub = self.create_publisher(
-            Float32, "/safety/status", 10
-        )
+        self.status_pub = self.create_publisher(Float32, "/safety/status", 10)
 
         # ===== Subscribers =====
         self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
         self.create_subscription(Odometry, "/odom", self.odom_callback, 10)
         self.create_subscription(Odometry, "/vesc/odom", self.odom_callback, 10)
-
-        # External override topics (Part B integration)
         self.create_subscription(Bool, "/safety/external_stop", self.external_stop_callback, 10)
         self.create_subscription(Float32, "/safety/max_speed", self.speed_limit_callback, 10)
-
-        # Also listen to drive commands to know current steering intent
         self.create_subscription(
             AckermannDriveStamped, "/vesc/high_level/input/nav_0",
             self.nav_callback, 10
@@ -151,17 +143,78 @@ class SafetyNode(Node):
             f'\033[96m╔══════════════════════════════════════════════════════════╗\033[0m'
         )
         self.get_logger().info(
-            f'\033[96m║  SAFETY CONTROLLER v2.0 - Mode: {self.mode.upper():^6}                  ║\033[0m'
+            f'\033[96m║  SAFETY CONTROLLER — config-driven                       ║\033[0m'
         )
         self.get_logger().info(
             f'\033[96m║  Brake accel: {self.brake_accel:.1f} m/s²  |  Min dist: {self.min_distance:.2f}m           ║\033[0m'
         )
         self.get_logger().info(
-            f'\033[96m║  Cone: {math.degrees(self.min_cone_angle):.0f}°-{math.degrees(self.max_cone_angle):.0f}° (speed-dependent)              ║\033[0m'
+            f'\033[96m║  Cone: {math.degrees(self.cone_min_angle):.0f}°-{math.degrees(self.cone_max_angle):.0f}° (speed-dependent)              ║\033[0m'
         )
         self.get_logger().info(
             f'\033[96m╚══════════════════════════════════════════════════════════╝\033[0m'
         )
+
+    # =========================================================================
+    # PARAMETER ACCESS
+    # =========================================================================
+
+    def _load_bundled_config(self) -> dict:
+        """Load the YAML config installed alongside the package.
+
+        Returns the dict under ``safety_node.ros__parameters``. Raises with a
+        clear message if the file is missing, malformed, or has the wrong
+        top-level shape.
+        """
+        path = os.path.join(
+            get_package_share_directory('safety_controller_pkg'),
+            'config',
+            'safety.yaml',
+        )
+        self.get_logger().info(f'\033[96mLoading safety config: {path}\033[0m')
+        try:
+            with open(path) as f:
+                doc = yaml.safe_load(f)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"Bundled safety config not found at {path}. "
+                f"Did `colcon build` install the config/ directory? "
+                f"Check setup.py data_files."
+            )
+        except yaml.YAMLError as e:
+            raise RuntimeError(f"safety.yaml is malformed: {e}")
+
+        params = (doc or {}).get('safety_node', {}).get('ros__parameters')
+        if not isinstance(params, dict):
+            raise RuntimeError(
+                f"safety.yaml at {path} is missing the "
+                f"'safety_node:\\n  ros__parameters:' top-level structure."
+            )
+        return params
+
+    def _req(self, name: str):
+        """Read a required parameter from the YAML, screaming if missing.
+
+        The YAML is the ground truth — there are no code-side defaults.
+        The value is also declared as a ROS parameter, so callers can
+        introspect or override it via `--params-file` / `-p key:=value`.
+        """
+        parts = name.split('.')
+        node = self._cfg
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                raise RuntimeError(
+                    f"Missing required safety-controller key '{name}' in "
+                    f"safety.yaml. Every key under safety_node.ros__parameters "
+                    f"must be present; there are no code-side defaults."
+                )
+            node = node[part]
+        yaml_value = node
+
+        # Declare so rclpy's override mechanism still applies cleanly.
+        if not self.has_parameter(name):
+            self.declare_parameter(name, yaml_value)
+        return self.get_parameter(name).value
 
     # =========================================================================
     # PHYSICS CALCULATIONS
@@ -170,15 +223,10 @@ class SafetyNode(Node):
     def compute_stopping_distance(self, speed: float) -> float:
         """Compute physics-based stopping distance.
 
-        Formula: d = v² / (2a) + v * t_reaction + lidar_to_bumper + safety_buffer
-
-        ``lidar_to_bumper`` is 0 for the launched MIT racecar_simulator (point
-        car); set it nonzero on the real car to account for the chassis
-        forward of the lidar.
+        d = v² / (2a) + v · t_reaction + lidar_to_bumper + safety_buffer
+        Floored at ``critical.min_distance``.
         """
         speed = abs(speed)
-
-        # Base: account for LIDAR-to-bumper offset + safety buffer
         base = self.lidar_to_bumper + self.safety_buffer
 
         if speed < 0.1:
@@ -187,71 +235,28 @@ class SafetyNode(Node):
         physics_dist = (speed ** 2) / (2 * self.brake_accel)
         reaction_dist = speed * self.reaction_time
         total = physics_dist + reaction_dist + base
-
         return max(self.min_distance, total)
 
     def compute_cone_angle(self, speed: float) -> float:
-        """Compute dynamic cone half-angle based on speed.
-
-        At low speed: wide cone for maneuvering
-        At high speed: narrow cone for straight-line racing
-
-        This prevents false triggers from cars in adjacent lanes on curves.
-        """
+        """Speed-dependent cone half-angle. Wide at v=0, narrow at high v."""
         speed = abs(speed)
-
-        # Linear interpolation based on speed
-        # At 0 m/s: max_cone_angle (wide)
-        # At max_speed: min_cone_angle (narrow)
-        speed_ratio = min(1.0, speed / self.max_speed)
-        angle = self.max_cone_angle - speed_ratio * (self.max_cone_angle - self.min_cone_angle)
-
-        return angle
+        speed_ratio = min(1.0, speed / self.cone_shrink_speed)
+        return self.cone_max_angle - speed_ratio * (self.cone_max_angle - self.cone_min_angle)
 
     def compute_steering_weight(self, obstacle_angle: float, steering: float) -> float:
-        """Weight obstacle danger by how much it's in our projected path.
-
-        If turning left (steering > 0), obstacles on the left are more dangerous.
-        Obstacles on the right of our turn are less likely to be hit.
-
-        Returns a weight 0.0 to 1.0 where 1.0 = directly in path.
-        """
+        """Weight obstacle danger by how much it's in our projected path."""
         if abs(steering) < 0.01:
-            # Going straight - symmetric weighting
             return 1.0
 
-        # Compute approximate turn radius and project path
-        if abs(steering) > 0.001:
-            turn_radius = self.wheelbase / math.tan(abs(steering))
-        else:
-            turn_radius = float('inf')
-
-        # If steering left (positive), our path curves left
-        # Obstacles at angles matching our turn direction are more dangerous
         turn_direction = 1.0 if steering > 0 else -1.0
-
-        # Angle difference from our turn center
-        # Obstacles in the direction we're turning get higher weight
         angle_alignment = obstacle_angle * turn_direction
 
         if angle_alignment > 0:
-            # Obstacle is in the direction we're turning - higher danger
-            weight = 1.0
-        else:
-            # Obstacle is opposite to turn direction - lower danger
-            # But still dangerous if close to centerline
-            weight = max(0.3, 1.0 - abs(obstacle_angle) / self.max_cone_angle)
-
-        return weight
+            return 1.0
+        return max(0.3, 1.0 - abs(obstacle_angle) / self.cone_max_angle)
 
     def get_scan_angles(self, speed: float) -> tuple:
-        """Get the forward cone half-angle for the current speed.
-
-        Returns ``(-cone, +cone)``. Reverse-direction scanning is handled
-        directly in ``scan_callback`` because a 270° lidar cannot see
-        directly behind, so we instead use the rear-most rays available
-        at the FOV edges.
-        """
+        """Forward cone half-angle for current speed; ``(-cone, +cone)``."""
         cone_angle = self.compute_cone_angle(speed)
         return (-cone_angle, cone_angle)
 
@@ -260,43 +265,36 @@ class SafetyNode(Node):
     # =========================================================================
 
     def odom_callback(self, msg: Odometry):
-        """Update current velocity from odometry."""
         self.current_speed = msg.twist.twist.linear.x
-        # Could also extract angular velocity if needed
 
     def nav_callback(self, msg: AckermannDriveStamped):
-        """Track the commanded nav drive command (steering + speed)."""
         self.current_steering = msg.drive.steering_angle
         self.current_nav_speed = msg.drive.speed
 
     def external_stop_callback(self, msg: Bool):
-        """Handle external stop requests (e.g., from traffic light detector)."""
-        if self.mode == 'race':
-            return  # Ignore external overrides in race mode
-
+        if not self.respect_external_stop:
+            return
         self.external_stop_requested = msg.data
         if msg.data:
             self.get_logger().warn('\033[95mExternal stop requested\033[0m')
 
     def speed_limit_callback(self, msg: Float32):
-        """Handle external speed limit (e.g., approaching intersection)."""
-        if self.mode == 'race':
-            return  # Ignore external overrides in race mode
-
+        if not self.respect_external_speed:
+            return
         if msg.data < 0:
-            self.external_speed_limit = None  # Clear limit
+            self.external_speed_limit = None
         else:
             self.external_speed_limit = msg.data
             self.get_logger().info(f'\033[95mExternal speed limit: {msg.data:.2f} m/s\033[0m')
 
     def check_laser_timeout(self):
-        """Stop the robot if LIDAR data stops arriving."""
+        """Emergency stop if /scan stops arriving."""
         now = self.get_clock().now()
 
         if self.last_scan_time is None:
             elapsed = (now - self.startup_time).nanoseconds / 1e9
             if elapsed <= self.laser_timeout:
-                return  # Grace period at startup
+                return
         else:
             elapsed = (now - self.last_scan_time).nanoseconds / 1e9
 
@@ -322,43 +320,36 @@ class SafetyNode(Node):
             self.get_logger().info('\033[92mLaser reconnected\033[0m')
 
     def scan_callback(self, msg: LaserScan):
-        """Main safety logic - process LIDAR scan and take action."""
+        """Main safety logic — process scan, classify zone, take action."""
         self.last_scan_time = self.get_clock().now()
 
-        # Handle external stop first
         if self.external_stop_requested:
             self.current_zone = SafetyZone.CRITICAL
             self.send_stop_command()
             return
 
-        # Parse scan data
         ranges = np.array(msg.ranges)
         angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
 
-        # Get dynamic parameters based on current state
         stopping_dist = self.compute_stopping_distance(self.current_speed)
         caution_dist = stopping_dist * self.caution_multiplier
         cone_angle = self.compute_cone_angle(self.current_speed)
 
-        # Build angle mask based on direction of travel.
-        if self.current_speed >= -0.1:  # Forward or stopped: scan front cone.
+        # Build angle mask. In reverse with reverse_scanning enabled, use
+        # the rear-most rays available (270° lidar can't see directly behind).
+        if self.current_speed >= -0.1 or not self.reverse_scanning:
             angle_mask = (angles >= -cone_angle) & (angles <= cone_angle)
         else:
-            # Reverse: the MIT lidar has a 270° FOV (±~2.355 rad), so it
-            # cannot see directly behind. Use the rear-most rays available
-            # — a cone of width ``cone_angle`` along each FOV edge.
             fov_edge = max(abs(msg.angle_min), abs(msg.angle_max))
             rear_threshold = max(0.0, fov_edge - cone_angle)
             angle_mask = np.abs(angles) >= rear_threshold
 
-        # Filter valid readings
         valid_mask = (
             angle_mask &
-            (ranges > 0.05) &  # Minimum range (avoid self-reflections)
+            (ranges > 0.05) &
             (ranges < msg.range_max) &
             np.isfinite(ranges)
         )
-
         valid_ranges = ranges[valid_mask]
         valid_angles = angles[valid_mask]
 
@@ -366,20 +357,16 @@ class SafetyNode(Node):
             self.current_zone = SafetyZone.CLEAR
             return
 
-        # Apply steering-based weighting
-        if self.mode == 'race' and abs(self.current_steering) > 0.05:
-            # In race mode with active steering, weight obstacles by path
+        # Steering-aware weighting (path projection).
+        if self.steering_aware_detection and abs(self.current_steering) > 0.05:
             weights = np.array([
                 self.compute_steering_weight(a, self.current_steering)
                 for a in valid_angles
             ])
-            # Effective distance = actual distance / weight
-            # Higher weight = obstacle more in path = effectively closer
             effective_ranges = valid_ranges / np.maximum(weights, 0.1)
         else:
             effective_ranges = valid_ranges
 
-        # Find closest obstacle
         min_idx = np.argmin(effective_ranges)
         min_effective_dist = effective_ranges[min_idx]
         min_actual_dist = valid_ranges[min_idx]
@@ -388,39 +375,42 @@ class SafetyNode(Node):
         self.closest_obstacle_dist = min_actual_dist
         self.closest_obstacle_angle = min_angle
 
-        # CRITICAL: inside the near edge of the CAUTION zone — hold a hard
-        # stop. Never autonomously reverse, otherwise we ping-pong
-        # (forward → reverse → cone flips → forward).
+        # ─── CRITICAL ─── inside stopping distance: hard brake.
         if min_actual_dist < stopping_dist:
             self.current_zone = SafetyZone.CRITICAL
-            avoidance = self.compute_avoidance_steering()
-            self.get_logger().error(
-                f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
-                f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
-                f'speed {self.current_speed:.2f} m/s) — STOP, steer {math.degrees(avoidance):+.0f}°\033[0m'
-            )
-            self.send_stop_command(avoidance)
+            if self.critical_steer_away:
+                avoidance = self.compute_avoidance_steering(self.critical_max_steering)
+                self.get_logger().error(
+                    f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
+                    f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
+                    f'speed {self.current_speed:.2f} m/s) — STOP, steer {math.degrees(avoidance):+.0f}°\033[0m'
+                )
+                self.send_stop_command(avoidance)
+            else:
+                self.get_logger().error(
+                    f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
+                    f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
+                    f'speed {self.current_speed:.2f} m/s) — STOP\033[0m'
+                )
+                self.send_stop_command()
+            return
 
-        # CAUTION: scale the nav-commanded speed by a distance-based factor.
-        # At the far edge of CAUTION (progress=0): factor = 1.0 → pass-through.
-        # At the near edge       (progress=1):     factor = 0.1 → 10% of nav.
-        # We scale the nav speed (not max_speed) so we never overdrive what
-        # the user actually asked for. Always publish — otherwise the mux's
-        # 0.5s safety_timeout releases nav and the car re-accelerates.
-        elif min_effective_dist < caution_dist:
+        # ─── CAUTION / AVOIDANCE ─── speed-scale within caution range.
+        if min_effective_dist < caution_dist:
             span = max(1e-6, caution_dist - stopping_dist)
             progress = (caution_dist - min_effective_dist) / span
             progress = max(0.0, min(1.0, progress))
-            factor = 1.0 - 0.9 * progress  # 1.0 → 0.1
+            factor = self.caution_start_factor - (
+                self.caution_start_factor - self.caution_end_factor
+            ) * progress
             max_allowed_speed = self.current_nav_speed * factor
 
             if self.external_speed_limit is not None:
                 max_allowed_speed = min(max_allowed_speed, self.external_speed_limit)
 
-            # Below 50% of nav speed we're close enough to start steering away.
-            if factor < 0.5:
+            if factor < self.caution_escalate and self.avoidance_enabled:
                 self.current_zone = SafetyZone.AVOIDANCE
-                avoidance = self.compute_avoidance_steering()
+                avoidance = self.compute_avoidance_steering(self.avoidance_max_steering)
                 self.get_logger().warn(
                     f'\033[95m[AVOIDANCE] Obstacle at {min_actual_dist:.2f}m, bearing '
                     f'{math.degrees(min_angle):+.0f}° — limiting to {max_allowed_speed:.2f} m/s, '
@@ -435,48 +425,39 @@ class SafetyNode(Node):
                         f'limiting {self.current_nav_speed:.2f}→{max_allowed_speed:.2f} m/s\033[0m'
                     )
                 self.send_speed_limit_command(max_allowed_speed)
+            return
 
-        else:
-            self.current_zone = SafetyZone.CLEAR
-            # Apply external speed limit even in clear zone
-            if self.external_speed_limit is not None and self.current_speed > self.external_speed_limit:
-                self.send_speed_limit_command(self.external_speed_limit)
-            # Otherwise, don't publish - let nav commands through
+        # ─── CLEAR ─── nothing in range.
+        self.current_zone = SafetyZone.CLEAR
+        if (self.external_speed_limit is not None
+                and self.current_speed > self.external_speed_limit):
+            self.send_speed_limit_command(self.external_speed_limit)
 
     # =========================================================================
     # COMMAND PUBLISHING
     # =========================================================================
 
-    def compute_avoidance_steering(self) -> float:
-        """Steering angle to nudge away from the closest obstacle while braking.
+    def compute_avoidance_steering(self, max_angle: float) -> float:
+        """Steering angle that nudges the car away from the closest obstacle.
 
-        Capped at ``critical_avoidance_angle`` (default 20°). Sign is opposite
-        the obstacle's bearing so the front of the car turns away from it.
-        Only active when moving forward — in reverse the rear-rays scan uses
-        FOV-edge angles, which don't map cleanly to a "steer away" direction.
+        ``max_angle`` is the cap (radians); the sign is opposite the
+        obstacle's bearing so the front turns away. For dead-center
+        obstacles the configured ``head_on_direction`` breaks the tie. In
+        reverse the rear-edge rays don't map cleanly to a steer direction,
+        so we return the held nav steering unchanged.
         """
         if self.current_speed < -0.1:
             return self.current_steering
 
         angle = self.closest_obstacle_angle
         if abs(angle) < 0.05:
-            # Dead-center: pick a side deterministically rather than 0,
-            # otherwise we just hold straight into the obstacle.
-            direction = -1.0
+            direction = self.head_on_sign
         else:
             direction = -1.0 if angle > 0 else 1.0
-        return direction * self.critical_avoidance_angle
+        return direction * max_angle
 
     def send_stop_command(self, steering: float | None = None):
-        """Send a hard-brake command.
-
-        Targets ``brake_speed`` (slightly negative by default) so the motor
-        actively brakes instead of being commanded to coast to 0. The value
-        is small enough that the car does not meaningfully reverse.
-
-        If ``steering`` is provided, it overrides the held nav steering — used
-        by the CRITICAL obstacle path to nudge away while braking.
-        """
+        """Hard-brake command. Targets ``critical.brake_speed``."""
         stop = AckermannDriveStamped()
         stop.header.stamp = self.get_clock().now().to_msg()
         stop.header.frame_id = "base_link"
@@ -486,12 +467,7 @@ class SafetyNode(Node):
         self.safety_pub.publish(stop)
 
     def send_speed_limit_command(self, max_speed: float, steering: float | None = None):
-        """Send speed limit command for graduated response.
-
-        If ``steering`` is provided, it overrides the held nav steering — used
-        by the AVOIDANCE zone to nudge away from the obstacle while still
-        allowing forward motion at a reduced speed.
-        """
+        """Speed-cap command for graduated response."""
         cmd = AckermannDriveStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = "base_link"
@@ -500,20 +476,9 @@ class SafetyNode(Node):
         self.safety_pub.publish(cmd)
 
     def publish_status(self):
-        """Publish current safety status for debugging/visualization."""
         status = Float32()
         status.data = float(self.current_zone)
         self.status_pub.publish(status)
-
-
-# =============================================================================
-# LEGACY COMPATIBILITY
-# =============================================================================
-# These class attributes allow the basic_sim to read parameters without
-# instantiating parameters (since the mock doesn't support declare_parameter)
-
-SafetyNode.SAFE_DISTANCE = 0.20  # Legacy: will be overridden by compute_stopping_distance
-SafetyNode.CONE_HALF_ANGLE = 1.5  # Legacy: will be overridden by compute_cone_angle
 
 
 def main():

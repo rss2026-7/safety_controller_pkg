@@ -1,0 +1,85 @@
+# =========================================================================
+# Safety controller configuration — GROUND TRUTH for runtime behavior.
+#
+# Every key in this file is REQUIRED. The node has no code-side defaults
+# and will refuse to start if anything below is missing or commented out.
+#
+# Zones (in order of severity):
+#   CLEAR     — obstacle further than caution range; nav passes through
+#   CAUTION   — obstacle in caution range; nav speed scaled down linearly
+#   AVOIDANCE — caution factor dropped below escalate_below_factor;
+#               speed-limited AND actively steering away from the obstacle
+#   CRITICAL  — obstacle inside stopping distance; hard brake + steer away
+# =========================================================================
+safety_node:
+  ros__parameters:
+
+    # ─── Detection cone (speed-dependent half-angle) ────────────────────
+    # Wide at low speed for maneuvering; narrow at high speed to avoid
+    # adjacent-lane false triggers on curves. Linear interpolation between
+    # max_angle (at v=0) and min_angle (at v >= shrink_speed).
+    cone:
+      max_angle:    1.5      # rad, half-cone at v = 0              (~86°)
+      min_angle:    0.4      # rad, half-cone at v >= shrink_speed  (~23°)
+      shrink_speed: 4.0      # m/s, speed at which cone reaches min_angle
+
+    # ─── Vehicle geometry ───────────────────────────────────────────────
+    vehicle:
+      wheelbase:       0.325 # m, axle-to-axle distance
+      lidar_to_bumper: 0.0   # m, distance from lidar origin to front bumper.
+                             # 0 for the launched MIT racecar_simulator
+                             # (point car). Set nonzero on the real car.
+
+    # ─── Stopping-distance physics ──────────────────────────────────────
+    # stopping_distance = v² / (2·brake_accel) + v·reaction_time
+    #                     + lidar_to_bumper + safety_buffer
+    # Floored at critical.min_distance.
+    physics:
+      brake_accel:   6.0     # m/s², deceleration in stop math AND stop cmd
+      reaction_time: 0.05    # s, latency margin
+      safety_buffer: 0.05    # m, padding beyond physics distance
+
+    # ─── Feature flags (replace mode-based branching) ───────────────────
+    features:
+      respect_external_stop:    true   # act on /safety/external_stop
+      respect_external_speed:   true   # act on /safety/max_speed
+      steering_aware_detection: false  # weight obstacles by projected turn radius
+      reverse_scanning:         true   # use FOV-edge rays when v < 0
+
+    # ─── Zone: CLEAR ────────────────────────────────────────────────────
+    # No tunables. Node stays silent (lets nav through) unless an external
+    # speed limit is active and current speed exceeds it.
+
+    # ─── Zone: CAUTION ──────────────────────────────────────────────────
+    # Range: [stopping_distance, stopping_distance × distance_multiplier]
+    # Action: scale nav-commanded speed by a linear factor.
+    #   factor(progress) = start_factor − (start_factor − end_factor)·progress
+    #   progress = 0 at outer (far) edge, 1 at inner (near) edge.
+    # When factor drops below escalate_below_factor, escalate to AVOIDANCE.
+    caution:
+      distance_multiplier:   2.857  # outer edge = stopping × this
+      start_factor:          1.0    # nav-speed multiplier at outer edge
+      end_factor:            0.1    # nav-speed multiplier at inner edge
+      escalate_below_factor: 0.5    # → AVOIDANCE when factor drops here
+
+    # ─── Zone: AVOIDANCE ────────────────────────────────────────────────
+    # Same speed scaling as CAUTION, but actively steers away from the
+    # closest obstacle. Disable for race profiles (weaving adds risk).
+    avoidance:
+      enabled:            true
+      max_steering_angle: 0.349    # rad (~20°), cap on steer-away angle
+      head_on_direction:  right    # tie-breaker for dead-center obstacles:
+                                   #   "left"  → turn left
+                                   #   "right" → turn right
+
+    # ─── Zone: CRITICAL ─────────────────────────────────────────────────
+    # Hard brake. Targets brake_speed (slightly negative = active brake).
+    # Steering nudged away from obstacle if steer_away is true.
+    critical:
+      min_distance:       0.35     # m, floor on stopping distance
+      brake_speed:        0.0      # m/s, target speed during stop
+      steer_away:         true     # apply avoidance steering during stop
+      max_steering_angle: 0.349    # rad (~20°), cap on steer-away angle
+
+    # ─── Watchdog ───────────────────────────────────────────────────────
+    laser_timeout: 0.5             # s, emergency stop if /scan stops arriving
