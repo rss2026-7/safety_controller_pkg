@@ -428,7 +428,7 @@ def main() -> int:
         fps_display = 0.9 * fps_display + 0.1 * clock.get_fps()
 
         # Enhanced HUD with safety zone info
-        zone_names = {0: "CLEAR", 1: "CAUTION", 2: "DANGER", 3: "CRITICAL"}
+        zone_names = {0: "CLEAR", 1: "CAUTION", 2: "AVOIDANCE", 3: "CRITICAL"}
         zone_name = zone_names.get(safety_node.current_zone, "?")
         renderer.draw_hud_v2(
             s, throttle, min_front, safety_active, nav_speed_cmd, fps_display,

@@ -129,7 +129,7 @@ class Renderer:
         ZONE_COLORS = {
             0: SAFETY_CONE_OK,                    # CLEAR - green
             1: (220, 180, 40, 70),                # CAUTION - yellow
-            2: SAFETY_CONE_WARN,                  # DANGER - red
+            2: SAFETY_CONE_WARN,                  # AVOIDANCE - red
             3: (255, 0, 255, 100),                # CRITICAL - magenta (pulsing)
         }
         color = ZONE_COLORS.get(zone, SAFETY_CONE_OK)
@@ -288,7 +288,7 @@ class Renderer:
         zone_colors = {
             "CLEAR": (60, 160, 90),
             "CAUTION": (220, 180, 40),
-            "DANGER": (220, 60, 60),
+            "AVOIDANCE": (220, 60, 60),
             "CRITICAL": (180, 30, 180),
         }
         zone_color = zone_colors.get(zone_name, (100, 100, 100))

@@ -11,7 +11,7 @@ Key improvements over basic safety controller:
   2. Dynamic cone angle that narrows at high speed
   3. Steering-aware obstacle weighting
   4. Direction-aware scanning (forward/reverse)
-  5. Graduated response zones (DANGER/CAUTION/CLEAR)
+  5. Graduated response zones (CLEAR/CAUTION/AVOIDANCE/CRITICAL)
   6. External override interface for perception integration
   7. Configurable modes (race vs city)
 """
@@ -31,8 +31,8 @@ from ackermann_msgs.msg import AckermannDriveStamped
 class SafetyZone:
     """Safety zone classification for graduated response."""
     CLEAR = 0      # No action needed, nav has full control
-    CAUTION = 1    # Reduce speed proportionally
-    DANGER = 2     # Emergency stop
+    CAUTION = 1    # Reduce speed proportionally (scale factor 1.0 → 0.5)
+    AVOIDANCE = 2  # Speed-limited and actively steering away (factor 0.5 → 0.1)
     CRITICAL = 3   # Already too close, maximum braking
 
 
@@ -85,6 +85,7 @@ class SafetyNode(Node):
         # this offset is effectively zero. Override on the real car.
         self.declare_parameter('lidar_to_bumper', 0.0)
         self.declare_parameter('safety_buffer', 0.05)  # Margin beyond physics
+        self.declare_parameter('critical_avoidance_angle', math.radians(20.0))
 
         self.mode = self.get_parameter('mode').value
         self.brake_accel = self.get_parameter('brake_accel').value
@@ -99,6 +100,7 @@ class SafetyNode(Node):
         self.lidar_to_bumper = self.get_parameter('lidar_to_bumper').value
         self.safety_buffer = self.get_parameter('safety_buffer').value
         self.brake_speed = self.get_parameter('brake_speed').value
+        self.critical_avoidance_angle = self.get_parameter('critical_avoidance_angle').value
 
         # ===== State variables =====
         self.current_speed = 0.0          # m/s, from odometry
@@ -391,11 +393,13 @@ class SafetyNode(Node):
         # (forward → reverse → cone flips → forward).
         if min_actual_dist < stopping_dist:
             self.current_zone = SafetyZone.CRITICAL
+            avoidance = self.compute_avoidance_steering()
             self.get_logger().error(
-                f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m '
-                f'(threshold {stopping_dist:.2f}m, speed {self.current_speed:.2f} m/s) — HOLDING STOP\033[0m'
+                f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
+                f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
+                f'speed {self.current_speed:.2f} m/s) — STOP, steer {math.degrees(avoidance):+.0f}°\033[0m'
             )
-            self.send_stop_command()
+            self.send_stop_command(avoidance)
 
         # CAUTION: scale the nav-commanded speed by a distance-based factor.
         # At the far edge of CAUTION (progress=0): factor = 1.0 → pass-through.
@@ -404,7 +408,6 @@ class SafetyNode(Node):
         # the user actually asked for. Always publish — otherwise the mux's
         # 0.5s safety_timeout releases nav and the car re-accelerates.
         elif min_effective_dist < caution_dist:
-            self.current_zone = SafetyZone.CAUTION
             span = max(1e-6, caution_dist - stopping_dist)
             progress = (caution_dist - min_effective_dist) / span
             progress = max(0.0, min(1.0, progress))
@@ -414,12 +417,24 @@ class SafetyNode(Node):
             if self.external_speed_limit is not None:
                 max_allowed_speed = min(max_allowed_speed, self.external_speed_limit)
 
-            if self.current_nav_speed > max_allowed_speed + 0.05:
-                self.get_logger().info(
-                    f'\033[93m[CAUTION] Obstacle at {min_actual_dist:.2f}m — '
-                    f'limiting {self.current_nav_speed:.2f}→{max_allowed_speed:.2f} m/s\033[0m'
+            # Below 50% of nav speed we're close enough to start steering away.
+            if factor < 0.5:
+                self.current_zone = SafetyZone.AVOIDANCE
+                avoidance = self.compute_avoidance_steering()
+                self.get_logger().warn(
+                    f'\033[95m[AVOIDANCE] Obstacle at {min_actual_dist:.2f}m, bearing '
+                    f'{math.degrees(min_angle):+.0f}° — limiting to {max_allowed_speed:.2f} m/s, '
+                    f'steer {math.degrees(avoidance):+.0f}°\033[0m'
                 )
-            self.send_speed_limit_command(max_allowed_speed)
+                self.send_speed_limit_command(max_allowed_speed, avoidance)
+            else:
+                self.current_zone = SafetyZone.CAUTION
+                if self.current_nav_speed > max_allowed_speed + 0.05:
+                    self.get_logger().info(
+                        f'\033[93m[CAUTION] Obstacle at {min_actual_dist:.2f}m — '
+                        f'limiting {self.current_nav_speed:.2f}→{max_allowed_speed:.2f} m/s\033[0m'
+                    )
+                self.send_speed_limit_command(max_allowed_speed)
 
         else:
             self.current_zone = SafetyZone.CLEAR
@@ -432,28 +447,56 @@ class SafetyNode(Node):
     # COMMAND PUBLISHING
     # =========================================================================
 
-    def send_stop_command(self):
+    def compute_avoidance_steering(self) -> float:
+        """Steering angle to nudge away from the closest obstacle while braking.
+
+        Capped at ``critical_avoidance_angle`` (default 20°). Sign is opposite
+        the obstacle's bearing so the front of the car turns away from it.
+        Only active when moving forward — in reverse the rear-rays scan uses
+        FOV-edge angles, which don't map cleanly to a "steer away" direction.
+        """
+        if self.current_speed < -0.1:
+            return self.current_steering
+
+        angle = self.closest_obstacle_angle
+        if abs(angle) < 0.05:
+            # Dead-center: pick a side deterministically rather than 0,
+            # otherwise we just hold straight into the obstacle.
+            direction = -1.0
+        else:
+            direction = -1.0 if angle > 0 else 1.0
+        return direction * self.critical_avoidance_angle
+
+    def send_stop_command(self, steering: float | None = None):
         """Send a hard-brake command.
 
         Targets ``brake_speed`` (slightly negative by default) so the motor
         actively brakes instead of being commanded to coast to 0. The value
         is small enough that the car does not meaningfully reverse.
+
+        If ``steering`` is provided, it overrides the held nav steering — used
+        by the CRITICAL obstacle path to nudge away while braking.
         """
         stop = AckermannDriveStamped()
         stop.header.stamp = self.get_clock().now().to_msg()
         stop.header.frame_id = "base_link"
         stop.drive.speed = self.brake_speed
         stop.drive.acceleration = -self.brake_accel
-        stop.drive.steering_angle = self.current_steering
+        stop.drive.steering_angle = self.current_steering if steering is None else steering
         self.safety_pub.publish(stop)
 
-    def send_speed_limit_command(self, max_speed: float):
-        """Send speed limit command for graduated response."""
+    def send_speed_limit_command(self, max_speed: float, steering: float | None = None):
+        """Send speed limit command for graduated response.
+
+        If ``steering`` is provided, it overrides the held nav steering — used
+        by the AVOIDANCE zone to nudge away from the obstacle while still
+        allowing forward motion at a reduced speed.
+        """
         cmd = AckermannDriveStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = "base_link"
         cmd.drive.speed = max_speed
-        cmd.drive.steering_angle = self.current_steering  # Maintain steering
+        cmd.drive.steering_angle = self.current_steering if steering is None else steering
         self.safety_pub.publish(cmd)
 
     def publish_status(self):
