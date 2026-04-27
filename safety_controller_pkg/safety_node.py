@@ -67,13 +67,16 @@ class SafetyNode(Node):
         self.cone_max_angle    = self._req('cone.max_angle')
         self.cone_min_angle    = self._req('cone.min_angle')
         self.cone_shrink_speed = self._req('cone.shrink_speed')
+        self.momentum_thinness = self._req('cone.momentum_thinness')
 
         self.wheelbase       = self._req('vehicle.wheelbase')
         self.lidar_to_bumper = self._req('vehicle.lidar_to_bumper')
 
-        self.brake_accel   = self._req('physics.brake_accel')
-        self.reaction_time = self._req('physics.reaction_time')
-        self.safety_buffer = self._req('physics.safety_buffer')
+        self.brake_accel            = self._req('physics.brake_accel')
+        self.pessimistic_accel      = self._req('physics.pessimistic_accel')
+        self.reaction_time          = self._req('physics.reaction_time')
+        self.safety_buffer          = self._req('physics.safety_buffer')
+        self.wheel_moving_threshold = self._req('physics.wheel_moving_threshold')
 
         self.respect_external_stop    = self._req('features.respect_external_stop')
         self.respect_external_speed   = self._req('features.respect_external_speed')
@@ -137,6 +140,7 @@ class SafetyNode(Node):
         # ===== Timers =====
         self.create_timer(0.1, self.check_laser_timeout)
         self.create_timer(0.05, self.publish_status)
+        self.create_timer(1.0, self.log_wheel_speed)
 
         # ===== Logging =====
         self.get_logger().info(
@@ -238,10 +242,39 @@ class SafetyNode(Node):
         return max(self.min_distance, total)
 
     def compute_cone_angle(self, speed: float) -> float:
-        """Speed-dependent cone half-angle. Wide at v=0, narrow at high v."""
+        """Speed-dependent cone half-angle. Wide at v=0, narrow at high v.
+
+        When the wheels are actually spinning (above wheel_moving_threshold)
+        the result is multiplied by momentum_thinness so the deeper
+        momentum-extended cone doesn't fan out wider at the same time.
+        """
         speed = abs(speed)
         speed_ratio = min(1.0, speed / self.cone_shrink_speed)
-        return self.cone_max_angle - speed_ratio * (self.cone_max_angle - self.cone_min_angle)
+        angle = self.cone_max_angle - speed_ratio * (self.cone_max_angle - self.cone_min_angle)
+        if speed > self.wheel_moving_threshold:
+            angle *= self.momentum_thinness
+        return angle
+
+    def compute_momentum_caution_distance(self, speed: float) -> float:
+        """Wheel-speed-driven extension of the CAUTION cone depth.
+
+        Uses pessimistic_accel (the deceleration the F1TENTH chassis
+        actually achieves when the VESC is commanded to 0 — much smaller
+        than the aspirational brake_accel) to bound how far ahead we
+        need to look:
+
+            d = v² / (2·pessimistic_accel) + v·reaction_time + safety_buffer
+
+        Gated on wheel_moving_threshold: returns 0 when the wheels aren't
+        spinning, so a parked car (or sim post-stop) doesn't extend the
+        cone. The caller takes max() with the existing caution_dist, so
+        this can only EXTEND the cone, never shrink it.
+        """
+        speed = abs(speed)
+        if speed < self.wheel_moving_threshold:
+            return 0.0
+        return (speed ** 2) / (2 * self.pessimistic_accel) \
+            + speed * self.reaction_time + self.safety_buffer
 
     def compute_steering_weight(self, obstacle_angle: float, steering: float) -> float:
         """Weight obstacle danger by how much it's in our projected path."""
@@ -332,7 +365,10 @@ class SafetyNode(Node):
         angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
 
         stopping_dist = self.compute_stopping_distance(self.current_speed)
-        caution_dist = stopping_dist * self.caution_multiplier
+        caution_dist = max(
+            stopping_dist * self.caution_multiplier,
+            self.compute_momentum_caution_distance(self.current_speed),
+        )
         cone_angle = self.compute_cone_angle(self.current_speed)
 
         # Build angle mask. In reverse with reverse_scanning enabled, use
@@ -479,6 +515,22 @@ class SafetyNode(Node):
         status = Float32()
         status.data = float(self.current_zone)
         self.status_pub.publish(status)
+
+    def log_wheel_speed(self):
+        """1 Hz live readout of wheel-encoder speed and the resulting cone depth."""
+        v = self.current_speed
+        moving = abs(v) > self.wheel_moving_threshold
+        momentum_d = self.compute_momentum_caution_distance(v)
+        stopping_d = self.compute_stopping_distance(v)
+        existing_d = stopping_d * self.caution_multiplier
+        caution_d  = max(existing_d, momentum_d)
+        marker = '●' if moving else '○'
+        self.get_logger().info(
+            f'\033[96m{marker} wheel_speed={v:+.2f} m/s | '
+            f'cone={caution_d:.2f}m (existing={existing_d:.2f}m, '
+            f'momentum={momentum_d:.2f}m) | '
+            f'stopping={stopping_d:.2f}m\033[0m'
+        )
 
 
 def main():

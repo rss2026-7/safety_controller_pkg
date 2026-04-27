@@ -18,10 +18,16 @@ safety_node:
     # Wide at low speed for maneuvering; narrow at high speed to avoid
     # adjacent-lane false triggers on curves. Linear interpolation between
     # max_angle (at v=0) and min_angle (at v >= shrink_speed).
+    #
+    # When the wheels are actually spinning (above
+    # physics.wheel_moving_threshold) the result is additionally
+    # multiplied by momentum_thinness, so the deeper momentum-extended
+    # cone doesn't fan out wider at the same time.
     cone:
-      max_angle:    1.5      # rad, half-cone at v = 0              (~86°)
-      min_angle:    0.4      # rad, half-cone at v >= shrink_speed  (~23°)
-      shrink_speed: 4.0      # m/s, speed at which cone reaches min_angle
+      max_angle:        1.5      # rad, half-cone at v = 0              (~86°)
+      min_angle:        0.4      # rad, half-cone at v >= shrink_speed  (~23°)
+      shrink_speed:     4.0      # m/s, speed at which cone reaches min_angle
+      momentum_thinness: 0.85    # ×, extra narrowing when wheels are spinning
 
     # ─── Vehicle geometry ───────────────────────────────────────────────
     vehicle:
@@ -31,13 +37,34 @@ safety_node:
                              # (point car). Set nonzero on the real car.
 
     # ─── Stopping-distance physics ──────────────────────────────────────
-    # stopping_distance = v² / (2·brake_accel) + v·reaction_time
-    #                     + lidar_to_bumper + safety_buffer
+    # Two decelerations are tracked:
+    #   brake_accel       — IDEAL decel; used by compute_stopping_distance()
+    #                       for the CRITICAL hard-stop trigger.
+    #   pessimistic_accel — REAL-WORLD decel for the F1TENTH chassis
+    #                       (~10 kg, mostly rolling-friction-limited).
+    #                       Used to EXTEND the CAUTION cone via max():
+    #                         cone_d = v² / (2·pessimistic_accel)
+    #                                + v·reaction_time + safety_buffer
+    #                       This represents what the car *actually* achieves
+    #                       when the VESC is commanded to 0. Smaller value
+    #                       → cone reaches further. 0.5 captures realistic
+    #                       VESC dynamic braking; drop to 0.3 if the car
+    #                       still hits walls at speed.
+    #   wheel_moving_threshold — the "are the wheels spinning?" gate. Below
+    #                       it, the momentum extension and the cone-angle
+    #                       narrowing are both disabled, so a parked car
+    #                       behaves identically to today.
+    #
+    # Existing stopping_distance formula is unchanged:
+    #   stopping_distance = v² / (2·brake_accel) + v·reaction_time
+    #                       + lidar_to_bumper + safety_buffer
     # Floored at critical.min_distance.
     physics:
-      brake_accel:   6.0     # m/s², deceleration in stop math AND stop cmd
-      reaction_time: 0.05    # s, latency margin
-      safety_buffer: 0.05    # m, padding beyond physics distance
+      brake_accel:            6.0    # m/s², ideal decel for hard-stop math
+      pessimistic_accel:      0.5    # m/s², real-world decel for cone depth
+      reaction_time:          0.05   # s, latency margin
+      safety_buffer:          0.05   # m, padding beyond physics distance
+      wheel_moving_threshold: 0.1    # m/s, below this the new behavior is off
 
     # ─── Feature flags (replace mode-based branching) ───────────────────
     features:
