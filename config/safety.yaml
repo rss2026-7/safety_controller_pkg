@@ -73,21 +73,13 @@ safety_node:
                                    #   "right" → turn right
 
     # ─── Zone: CRITICAL ─────────────────────────────────────────────────
-    # Hard brake. Targets brake_speed once the wheels are stopped. While
-    # the wheels are still rolling (|measured speed| > stop_speed_threshold)
-    # the stop() method runs a P-loop:
-    #   commanded_speed = clamp(-brake_p_gain · current_speed, ±brake_max_command)
-    # The sim has no momentum so this collapses to brake_speed instantly.
-    # The real car coasts and needs the negative drive to brake actively.
+    # Hard brake. Targets brake_speed (slightly negative = active brake).
     # Steering nudged away from obstacle if steer_away is true.
     critical:
-      min_distance:         0.35   # m, floor on stopping distance
-      brake_speed:          0.0    # m/s, target speed once stopped
-      steer_away:           true   # apply avoidance steering during stop
-      max_steering_angle:   0.349  # rad (~20°), cap on steer-away angle
-      brake_p_gain:         1.5    # reverse-speed per m/s of measured speed
-      stop_speed_threshold: 0.1    # m/s, below this we trust the car is stopped
-      brake_max_command:    2.0    # m/s, cap on |reverse drive command|
+      min_distance:       0.35     # m, floor on stopping distance
+      brake_speed:        0.0      # m/s, target speed during stop
+      steer_away:         true     # apply avoidance steering during stop
+      max_steering_angle: 0.349    # rad (~20°), cap on steer-away angle
 
     # ─── Watchdog ───────────────────────────────────────────────────────
     laser_timeout: 0.5             # s, emergency stop if /scan stops arriving
