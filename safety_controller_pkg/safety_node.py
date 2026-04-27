@@ -95,10 +95,13 @@ class SafetyNode(Node):
         # Steering convention: positive = left turn.
         self.head_on_sign = 1.0 if head_on == 'left' else -1.0
 
-        self.min_distance          = self._req('critical.min_distance')
-        self.brake_speed           = self._req('critical.brake_speed')
-        self.critical_steer_away   = self._req('critical.steer_away')
-        self.critical_max_steering = self._req('critical.max_steering_angle')
+        self.min_distance           = self._req('critical.min_distance')
+        self.brake_speed            = self._req('critical.brake_speed')
+        self.critical_steer_away    = self._req('critical.steer_away')
+        self.critical_max_steering  = self._req('critical.max_steering_angle')
+        self.brake_p_gain           = self._req('critical.brake_p_gain')
+        self.stop_speed_threshold   = self._req('critical.stop_speed_threshold')
+        self.brake_max_command      = self._req('critical.brake_max_command')
 
         self.laser_timeout = self._req('laser_timeout')
 
@@ -314,7 +317,7 @@ class SafetyNode(Node):
                     f'\033[91m╚═══════════════════════════════════════════╝\033[0m'
                 )
             self.current_zone = SafetyZone.CRITICAL
-            self.send_stop_command()
+            self.stop()
         elif self.laser_disconnected:
             self.laser_disconnected = False
             self.get_logger().info('\033[92mLaser reconnected\033[0m')
@@ -325,7 +328,7 @@ class SafetyNode(Node):
 
         if self.external_stop_requested:
             self.current_zone = SafetyZone.CRITICAL
-            self.send_stop_command()
+            self.stop()
             return
 
         ranges = np.array(msg.ranges)
@@ -385,14 +388,14 @@ class SafetyNode(Node):
                     f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
                     f'speed {self.current_speed:.2f} m/s) — STOP, steer {math.degrees(avoidance):+.0f}°\033[0m'
                 )
-                self.send_stop_command(avoidance)
+                self.stop(avoidance)
             else:
                 self.get_logger().error(
                     f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
                     f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
                     f'speed {self.current_speed:.2f} m/s) — STOP\033[0m'
                 )
-                self.send_stop_command()
+                self.stop()
             return
 
         # ─── CAUTION / AVOIDANCE ─── speed-scale within caution range.
@@ -456,15 +459,32 @@ class SafetyNode(Node):
             direction = -1.0 if angle > 0 else 1.0
         return direction * max_angle
 
-    def send_stop_command(self, steering: float | None = None):
-        """Hard-brake command. Targets ``critical.brake_speed``."""
-        stop = AckermannDriveStamped()
-        stop.header.stamp = self.get_clock().now().to_msg()
-        stop.header.frame_id = "base_link"
-        stop.drive.speed = self.brake_speed
-        stop.drive.acceleration = -self.brake_accel
-        stop.drive.steering_angle = self.current_steering if steering is None else steering
-        self.safety_pub.publish(stop)
+    def stop(self, steering: float | None = None):
+        """Momentum-aware brake command.
+
+        While the measured wheel speed is above ``stop_speed_threshold`` we
+        command the VESC opposite the direction of motion, magnitude
+        proportional to current_speed (P-loop), clamped to
+        ``brake_max_command``. Once the wheels are below threshold we settle
+        onto ``brake_speed``. The sim has no momentum so ``current_speed``
+        collapses to ~0 immediately and this becomes a plain stop; the real
+        car coasts and needs the active reverse drive to actually halt.
+        """
+        cmd = AckermannDriveStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.frame_id = "base_link"
+
+        if abs(self.current_speed) < self.stop_speed_threshold:
+            target_speed = self.brake_speed
+        else:
+            target_speed = -self.brake_p_gain * self.current_speed
+            cap = self.brake_max_command
+            target_speed = max(-cap, min(cap, target_speed))
+
+        cmd.drive.speed = target_speed
+        cmd.drive.acceleration = -self.brake_accel
+        cmd.drive.steering_angle = self.current_steering if steering is None else steering
+        self.safety_pub.publish(cmd)
 
     def send_speed_limit_command(self, max_speed: float, steering: float | None = None):
         """Speed-cap command for graduated response."""
