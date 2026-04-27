@@ -70,28 +70,25 @@ class SafetyNode(Node):
         # ===== Declare and get parameters =====
         self.declare_parameter('mode', 'city')
         self.declare_parameter('brake_accel', 6.0)
-        self.declare_parameter('min_distance', 0.20)
-        self.declare_parameter('critical_distance', 0.15)  # ~6 inches - ACTIVE REVERSE
+        self.declare_parameter('min_distance', 0.35)        # CRITICAL threshold floor (m)
         self.declare_parameter('reaction_time', 0.05)
         self.declare_parameter('max_cone_angle', 1.5)
         self.declare_parameter('min_cone_angle', 0.4)
-        self.declare_parameter('caution_multiplier', 2.0)
+        self.declare_parameter('caution_multiplier', 2.857) # CAUTION = stopping × this (~1.0m at v=0)
+        self.declare_parameter('brake_speed', 0.0)          # Target speed during CRITICAL hard stop
         self.declare_parameter('laser_timeout', 0.5)
         self.declare_parameter('max_speed', 4.0)
         self.declare_parameter('wheelbase', 0.325)
-        self.declare_parameter('reverse_speed', 0.5)  # Speed to reverse at in CRITICAL
-        # CRITICAL: Distance from LIDAR to front bumper!
-        # LIDAR is at wheelbase (0.325m) from rear axle
-        # Front bumper is at length - rear_overhang (0.50 - 0.05 = 0.45m) from rear axle
-        # So front bumper is 0.45 - 0.325 = 0.125m AHEAD of LIDAR
-        # When LIDAR sees obstacle at X meters, front bumper is at (X - 0.125) meters from obstacle!
-        self.declare_parameter('lidar_to_bumper', 0.125)  # MUST account for this offset!
-        self.declare_parameter('safety_buffer', 0.10)  # Extra buffer beyond physics (user configurable)
+        # Distance from LIDAR origin to the front bumper. The launched MIT
+        # racecar_simulator is a point car with no chassis or collision body,
+        # and its lidar sits 0.275m forward of base_link — so for the sim
+        # this offset is effectively zero. Override on the real car.
+        self.declare_parameter('lidar_to_bumper', 0.0)
+        self.declare_parameter('safety_buffer', 0.05)  # Margin beyond physics
 
         self.mode = self.get_parameter('mode').value
         self.brake_accel = self.get_parameter('brake_accel').value
         self.min_distance = self.get_parameter('min_distance').value
-        self.critical_distance = self.get_parameter('critical_distance').value
         self.reaction_time = self.get_parameter('reaction_time').value
         self.max_cone_angle = self.get_parameter('max_cone_angle').value
         self.min_cone_angle = self.get_parameter('min_cone_angle').value
@@ -99,13 +96,14 @@ class SafetyNode(Node):
         self.laser_timeout = self.get_parameter('laser_timeout').value
         self.max_speed = self.get_parameter('max_speed').value
         self.wheelbase = self.get_parameter('wheelbase').value
-        self.reverse_speed = self.get_parameter('reverse_speed').value
         self.lidar_to_bumper = self.get_parameter('lidar_to_bumper').value
         self.safety_buffer = self.get_parameter('safety_buffer').value
+        self.brake_speed = self.get_parameter('brake_speed').value
 
         # ===== State variables =====
         self.current_speed = 0.0          # m/s, from odometry
-        self.current_steering = 0.0       # rad, from odometry or drive commands
+        self.current_steering = 0.0       # rad, from nav drive commands
+        self.current_nav_speed = 0.0      # m/s, last commanded nav speed
         self.last_scan_time = None
         self.laser_disconnected = False
         self.startup_time = self.get_clock().now()
@@ -170,11 +168,11 @@ class SafetyNode(Node):
     def compute_stopping_distance(self, speed: float) -> float:
         """Compute physics-based stopping distance.
 
-        IMPORTANT: All distances are measured from LIDAR, but the front bumper
-        is lidar_to_bumper (0.125m) AHEAD of the LIDAR! So we must add this
-        offset to all calculations.
-
         Formula: d = v² / (2a) + v * t_reaction + lidar_to_bumper + safety_buffer
+
+        ``lidar_to_bumper`` is 0 for the launched MIT racecar_simulator (point
+        car); set it nonzero on the real car to account for the chassis
+        forward of the lidar.
         """
         speed = abs(speed)
 
@@ -189,32 +187,6 @@ class SafetyNode(Node):
         total = physics_dist + reaction_dist + base
 
         return max(self.min_distance, total)
-
-    def compute_critical_distance(self, speed: float) -> float:
-        """Compute velocity-dependent CRITICAL zone distance.
-
-        CRITICAL zone triggers active reverse. It must be far enough that
-        even with current momentum, the car can stop before collision.
-
-        IMPORTANT: Must include lidar_to_bumper offset since LIDAR measures
-        from a point 0.125m BEHIND the front bumper!
-        """
-        speed = abs(speed)
-
-        # Base: LIDAR-to-bumper offset + larger safety buffer for critical zone
-        base = self.lidar_to_bumper + self.safety_buffer * 1.5
-
-        if speed < 0.1:
-            return max(self.critical_distance, base)
-
-        # Time to stop from current speed with max braking
-        time_to_stop = speed / self.brake_accel
-        # Distance traveled during that time (starting at speed, ending at 0)
-        distance_during_stop = speed * time_to_stop / 2  # = v²/(2a)
-        # Add margin for reaction time
-        total = distance_during_stop + speed * 0.1 + base
-
-        return max(self.critical_distance, total)
 
     def compute_cone_angle(self, speed: float) -> float:
         """Compute dynamic cone half-angle based on speed.
@@ -271,17 +243,15 @@ class SafetyNode(Node):
         return weight
 
     def get_scan_angles(self, speed: float) -> tuple:
-        """Get the angle range to scan based on direction of travel.
+        """Get the forward cone half-angle for the current speed.
 
-        Forward motion: scan front
-        Reverse motion: scan rear
+        Returns ``(-cone, +cone)``. Reverse-direction scanning is handled
+        directly in ``scan_callback`` because a 270° lidar cannot see
+        directly behind, so we instead use the rear-most rays available
+        at the FOV edges.
         """
         cone_angle = self.compute_cone_angle(speed)
-
-        if speed >= -0.1:  # Going forward or stopped
-            return (-cone_angle, cone_angle)
-        else:  # Reversing
-            return (math.pi - cone_angle, math.pi + cone_angle)
+        return (-cone_angle, cone_angle)
 
     # =========================================================================
     # CALLBACKS
@@ -293,8 +263,9 @@ class SafetyNode(Node):
         # Could also extract angular velocity if needed
 
     def nav_callback(self, msg: AckermannDriveStamped):
-        """Track commanded steering angle for path prediction."""
+        """Track the commanded nav drive command (steering + speed)."""
         self.current_steering = msg.drive.steering_angle
+        self.current_nav_speed = msg.drive.speed
 
     def external_stop_callback(self, msg: Bool):
         """Handle external stop requests (e.g., from traffic light detector)."""
@@ -354,7 +325,7 @@ class SafetyNode(Node):
 
         # Handle external stop first
         if self.external_stop_requested:
-            self.current_zone = SafetyZone.DANGER
+            self.current_zone = SafetyZone.CRITICAL
             self.send_stop_command()
             return
 
@@ -365,14 +336,18 @@ class SafetyNode(Node):
         # Get dynamic parameters based on current state
         stopping_dist = self.compute_stopping_distance(self.current_speed)
         caution_dist = stopping_dist * self.caution_multiplier
-        scan_min, scan_max = self.get_scan_angles(self.current_speed)
+        cone_angle = self.compute_cone_angle(self.current_speed)
 
-        # Build angle mask based on direction
-        if self.current_speed >= -0.1:  # Forward
-            angle_mask = (angles >= scan_min) & (angles <= scan_max)
-        else:  # Reverse - angles around pi
-            # Handle wraparound
-            angle_mask = (angles >= scan_min) | (angles <= scan_max - 2*math.pi)
+        # Build angle mask based on direction of travel.
+        if self.current_speed >= -0.1:  # Forward or stopped: scan front cone.
+            angle_mask = (angles >= -cone_angle) & (angles <= cone_angle)
+        else:
+            # Reverse: the MIT lidar has a 270° FOV (±~2.355 rad), so it
+            # cannot see directly behind. Use the rear-most rays available
+            # — a cone of width ``cone_angle`` along each FOV edge.
+            fov_edge = max(abs(msg.angle_min), abs(msg.angle_max))
+            rear_threshold = max(0.0, fov_edge - cone_angle)
+            angle_mask = np.abs(angles) >= rear_threshold
 
         # Filter valid readings
         valid_mask = (
@@ -411,65 +386,40 @@ class SafetyNode(Node):
         self.closest_obstacle_dist = min_actual_dist
         self.closest_obstacle_angle = min_angle
 
-        # Compute dynamic critical distance based on current speed
-        # This accounts for the time needed to decelerate and reverse
-        dynamic_critical = self.compute_critical_distance(self.current_speed)
-
-        # Determine safety zone and take action
-        # CRITICAL: Too close! Active reverse to prevent collision
-        if min_actual_dist < dynamic_critical:
+        # CRITICAL: inside the near edge of the CAUTION zone — hold a hard
+        # stop. Never autonomously reverse, otherwise we ping-pong
+        # (forward → reverse → cone flips → forward).
+        if min_actual_dist < stopping_dist:
             self.current_zone = SafetyZone.CRITICAL
             self.get_logger().error(
-                f'\033[91;1m╔═══════════════════════════════════════════════════════════╗\033[0m'
-            )
-            self.get_logger().error(
-                f'\033[91;1m║  CRITICAL @ {min_actual_dist:.2f}m (threshold {dynamic_critical:.2f}m)           ║\033[0m'
-            )
-            self.get_logger().error(
-                f'\033[91;1m║  Speed: {self.current_speed:.2f} m/s — ACTIVE REVERSE ENGAGED           ║\033[0m'
-            )
-            self.get_logger().error(
-                f'\033[91;1m╚═══════════════════════════════════════════════════════════╝\033[0m'
-            )
-            self.send_reverse_command(min_angle)
-
-        # DANGER: Within stopping distance, emergency stop
-        elif min_effective_dist < stopping_dist:
-            self.current_zone = SafetyZone.DANGER
-            self.get_logger().warn(
-                f'\033[91m[DANGER] Obstacle at {min_actual_dist:.2f}m '
-                f'(angle: {math.degrees(min_angle):.0f}°) — EMERGENCY STOP '
-                f'(stop_dist: {stopping_dist:.2f}m @ {self.current_speed:.1f}m/s)\033[0m'
+                f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m '
+                f'(threshold {stopping_dist:.2f}m, speed {self.current_speed:.2f} m/s) — HOLDING STOP\033[0m'
             )
             self.send_stop_command()
 
-        # CAUTION: Approaching, reduce speed
+        # CAUTION: scale the nav-commanded speed by a distance-based factor.
+        # At the far edge of CAUTION (progress=0): factor = 1.0 → pass-through.
+        # At the near edge       (progress=1):     factor = 0.1 → 10% of nav.
+        # We scale the nav speed (not max_speed) so we never overdrive what
+        # the user actually asked for. Always publish — otherwise the mux's
+        # 0.5s safety_timeout releases nav and the car re-accelerates.
         elif min_effective_dist < caution_dist:
             self.current_zone = SafetyZone.CAUTION
-            # Graduated response: reduce allowed speed proportionally
-            # At edge of caution zone: full speed allowed
-            # At edge of danger zone: minimal speed
-            zone_progress = (caution_dist - min_effective_dist) / (caution_dist - stopping_dist)
-            zone_progress = max(0.0, min(1.0, zone_progress))
+            span = max(1e-6, caution_dist - stopping_dist)
+            progress = (caution_dist - min_effective_dist) / span
+            progress = max(0.0, min(1.0, progress))
+            factor = 1.0 - 0.9 * progress  # 1.0 → 0.1
+            max_allowed_speed = self.current_nav_speed * factor
 
-            # Calculate reduced speed
-            min_caution_speed = 0.5  # Don't go below this in caution
-            max_allowed_speed = self.max_speed * (1.0 - zone_progress * 0.7)
-            max_allowed_speed = max(min_caution_speed, max_allowed_speed)
-
-            # Apply external speed limit if set
             if self.external_speed_limit is not None:
                 max_allowed_speed = min(max_allowed_speed, self.external_speed_limit)
 
-            if self.current_speed > max_allowed_speed + 0.1:
+            if self.current_nav_speed > max_allowed_speed + 0.05:
                 self.get_logger().info(
                     f'\033[93m[CAUTION] Obstacle at {min_actual_dist:.2f}m — '
-                    f'limiting to {max_allowed_speed:.1f}m/s\033[0m'
+                    f'limiting {self.current_nav_speed:.2f}→{max_allowed_speed:.2f} m/s\033[0m'
                 )
-                self.send_speed_limit_command(max_allowed_speed)
-            else:
-                # Log less frequently when not actively limiting
-                pass
+            self.send_speed_limit_command(max_allowed_speed)
 
         else:
             self.current_zone = SafetyZone.CLEAR
@@ -483,43 +433,19 @@ class SafetyNode(Node):
     # =========================================================================
 
     def send_stop_command(self):
-        """Send emergency stop command."""
+        """Send a hard-brake command.
+
+        Targets ``brake_speed`` (slightly negative by default) so the motor
+        actively brakes instead of being commanded to coast to 0. The value
+        is small enough that the car does not meaningfully reverse.
+        """
         stop = AckermannDriveStamped()
         stop.header.stamp = self.get_clock().now().to_msg()
         stop.header.frame_id = "base_link"
-        stop.drive.speed = 0.0
-        stop.drive.acceleration = -self.brake_accel  # Request maximum deceleration
-        stop.drive.steering_angle = self.current_steering  # Maintain steering
+        stop.drive.speed = self.brake_speed
+        stop.drive.acceleration = -self.brake_accel
+        stop.drive.steering_angle = self.current_steering
         self.safety_pub.publish(stop)
-
-    def send_reverse_command(self, obstacle_angle: float):
-        """Send active reverse command to back away from imminent collision.
-
-        This is the last line of defense - if we're within critical_distance,
-        actively reverse to prevent contact. The steering is adjusted to back
-        away from the obstacle direction.
-        """
-        cmd = AckermannDriveStamped()
-        cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.header.frame_id = "base_link"
-
-        # Reverse at configured speed
-        cmd.drive.speed = -self.reverse_speed
-        cmd.drive.acceleration = -self.brake_accel  # Max decel/accel authority
-
-        # Steer away from obstacle while reversing
-        # If obstacle is on the left (positive angle), steer right while reversing
-        # (which will move the front away from the obstacle)
-        # If obstacle is on the right (negative angle), steer left while reversing
-        if abs(obstacle_angle) > 0.1:  # Only adjust steering if obstacle is off-center
-            # Reverse steering direction because we're going backwards
-            escape_steer = -math.copysign(0.2, obstacle_angle)  # Gentle escape steering
-            cmd.drive.steering_angle = escape_steer
-        else:
-            # Obstacle is dead ahead, just reverse straight
-            cmd.drive.steering_angle = 0.0
-
-        self.safety_pub.publish(cmd)
 
     def send_speed_limit_command(self, max_speed: float):
         """Send speed limit command for graduated response."""
