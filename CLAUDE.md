@@ -23,8 +23,8 @@ is missing. To change behavior, edit the YAML and rebuild (or pass an
 override path via the `config:=` launch arg).
 
 Top-level sections: `cone`, `vehicle`, `physics`, `features`, `caution`,
-`avoidance`, `critical`, `laser_timeout`. See the YAML's inline comments
-for the meaning and units of every key.
+`avoidance`, `critical`, `person_critical`, `laser_timeout`. See the YAML's
+inline comments for the meaning and units of every key.
 
 ## Architecture
 
@@ -60,4 +60,4 @@ On every commit:
    git tag -a v2.1.0 -m "Release v2.1.0"
    ```
 
-Current version: **2.4.2**
+Current version: **2.5.0**

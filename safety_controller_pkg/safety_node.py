@@ -24,7 +24,7 @@ from rclpy.node import Node
 import numpy as np
 from ament_index_python.packages import get_package_share_directory
 
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, RegionOfInterest
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float32, String
 from ackermann_msgs.msg import AckermannDriveStamped
@@ -103,6 +103,15 @@ class SafetyNode(Node):
         self.critical_steer_away   = self._req('critical.steer_away')
         self.critical_max_steering = self._req('critical.max_steering_angle')
 
+        self.person_critical_enabled  = self._req('person_critical.enabled')
+        self.person_image_width       = self._req('person_critical.image_width')
+        self.person_image_height      = self._req('person_critical.image_height')
+        self.person_area_fraction     = self._req('person_critical.area_fraction')
+        self.person_area_threshold_px = (
+            self.person_image_width * self.person_image_height
+            * self.person_area_fraction
+        )
+
         self.laser_timeout = self._req('laser_timeout')
 
         # ===== State variables =====
@@ -116,6 +125,8 @@ class SafetyNode(Node):
         self.external_stop_requested = False
         self.external_speed_limit = None  # None = no limit
         self.stoplight_red = False
+        self.person_too_close = False
+        self.person_last_area_px = 0
 
         self.current_zone = SafetyZone.CLEAR
         self.closest_obstacle_dist = float('inf')
@@ -138,6 +149,10 @@ class SafetyNode(Node):
             self.nav_callback, 10
         )
         self.create_subscription(String, "/stoplight/result", self.stoplight_callback, 10)
+        if self.person_critical_enabled:
+            self.create_subscription(
+                RegionOfInterest, "/yolo/person/roi", self.person_roi_callback, 10
+            )
 
         # ===== Timers =====
         self.create_timer(0.1, self.check_laser_timeout)
@@ -313,6 +328,24 @@ class SafetyNode(Node):
         if msg.data:
             self.get_logger().warn('\033[95mExternal stop requested\033[0m')
 
+    def person_roi_callback(self, msg: RegionOfInterest):
+        """Track whether YOLO sees a person filling a large area of the frame.
+
+        yolo_node publishes every frame: width=0/height=0 means "not detected
+        this frame", so a non-detection naturally clears the flag. Threshold
+        is precomputed in pixels at startup from the configured image size.
+        """
+        area = int(msg.width) * int(msg.height)
+        self.person_last_area_px = area
+        was_close = self.person_too_close
+        self.person_too_close = area >= self.person_area_threshold_px
+        if self.person_too_close and not was_close:
+            self.get_logger().error(
+                f'\033[91;1m[PERSON] Large person bbox '
+                f'({msg.width}×{msg.height}={area}px) ≥ '
+                f'threshold {self.person_area_threshold_px:.0f}px — CRITICAL stop\033[0m'
+            )
+
     def stoplight_callback(self, msg: String):
         was_red = self.stoplight_red
         self.stoplight_red = (msg.data == "red")
@@ -370,6 +403,11 @@ class SafetyNode(Node):
             return
 
         if self.stoplight_red:
+            self.current_zone = SafetyZone.CRITICAL
+            self.send_stop_command(0.0)
+            return
+
+        if self.person_too_close:
             self.current_zone = SafetyZone.CRITICAL
             self.send_stop_command(0.0)
             return

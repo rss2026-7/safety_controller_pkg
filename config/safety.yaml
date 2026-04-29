@@ -24,10 +24,10 @@ safety_node:
     # multiplied by momentum_thinness, so the deeper momentum-extended
     # cone doesn't fan out wider at the same time.
     cone:
-      max_angle:        1.5      # rad, half-cone at v = 0              (~86°)
-      min_angle:        0.4      # rad, half-cone at v >= shrink_speed  (~23°)
-      shrink_speed:     4.0      # m/s, speed at which cone reaches min_angle
-      momentum_thinness: 0.85    # ×, extra narrowing when wheels are spinning
+      max_angle:        1.2      # rad, half-cone at v = 0              (~69°)
+      min_angle:        0.25     # rad, half-cone at v >= shrink_speed  (~14°)
+      shrink_speed:     3.0      # m/s, speed at which cone reaches min_angle
+      momentum_thinness: 0.75    # ×, extra narrowing when wheels are spinning
 
     # ─── Vehicle geometry ───────────────────────────────────────────────
     vehicle:
@@ -60,11 +60,11 @@ safety_node:
     #                       + lidar_to_bumper + safety_buffer
     # Floored at critical.min_distance.
     physics:
-      brake_accel:            6.0    # m/s², ideal decel for hard-stop math
-      pessimistic_accel:      0.5    # m/s², real-world decel for cone depth
-      reaction_time:          0.05   # s, latency margin
-      safety_buffer:          0.05   # m, padding beyond physics distance
-      wheel_moving_threshold: 0.1    # m/s, below this the new behavior is off
+      brake_accel:            8.0    # m/s², ideal decel for hard-stop math
+      pessimistic_accel:      0.8    # m/s², real-world decel for cone depth
+      reaction_time:          0.02   # s, latency margin
+      safety_buffer:          0.02   # m, padding beyond physics distance
+      wheel_moving_threshold: 0.05   # m/s, below this the new behavior is off
 
     # ─── Feature flags (replace mode-based branching) ───────────────────
     features:
@@ -84,10 +84,10 @@ safety_node:
     #   progress = 0 at outer (far) edge, 1 at inner (near) edge.
     # When factor drops below escalate_below_factor, escalate to AVOIDANCE.
     caution:
-      distance_multiplier:   2.857  # outer edge = stopping × this
+      distance_multiplier:   2.0    # outer edge = stopping × this
       start_factor:          1.0    # nav-speed multiplier at outer edge
-      end_factor:            0.1    # nav-speed multiplier at inner edge
-      escalate_below_factor: 0.5    # → AVOIDANCE when factor drops here
+      end_factor:            0.25   # nav-speed multiplier at inner edge
+      escalate_below_factor: 0.35   # → AVOIDANCE when factor drops here
 
     # ─── Zone: AVOIDANCE ────────────────────────────────────────────────
     # Same speed scaling as CAUTION, but actively steers away from the
@@ -103,10 +103,24 @@ safety_node:
     # Hard brake. Targets brake_speed (slightly negative = active brake).
     # Steering nudged away from obstacle if steer_away is true.
     critical:
-      min_distance:       0.35     # m, floor on stopping distance
+      min_distance:       0.2      # m, floor on stopping distance
       brake_speed:        0.0      # m/s, target speed during stop
       steer_away:         true     # apply avoidance steering during stop
       max_steering_angle: 0.349    # rad (~20°), cap on steer-away angle
 
+    # ─── Person-detection critical stop (YOLO) ──────────────────────────
+    # Subscribes to /yolo/person/roi (sensor_msgs/RegionOfInterest) from
+    # final_challenge's yolo_node. When the detected bbox area exceeds
+    # area_fraction × (image_width × image_height) — i.e. the person fills
+    # a "large" portion of the frame — escalate straight to CRITICAL and
+    # hard-brake. image_width/image_height are the source camera's full
+    # resolution (denominator for the fraction), NOT the bbox size. Set
+    # enabled: false to disable the check entirely.
+    person_critical:
+      enabled:        true
+      image_width:    672      # px, source-camera width  (ZED rgb_rect default)
+      image_height:   376      # px, source-camera height
+      area_fraction:  0.15     # 0–1, bbox-area / image-area to trigger CRITICAL
+
     # ─── Watchdog ───────────────────────────────────────────────────────
-    laser_timeout: 0.5             # s, emergency stop if /scan stops arriving
+    laser_timeout: 1.0             # s, emergency stop if /scan stops arriving
