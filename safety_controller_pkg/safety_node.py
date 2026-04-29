@@ -26,7 +26,7 @@ from ament_index_python.packages import get_package_share_directory
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 from ackermann_msgs.msg import AckermannDriveStamped
 
 
@@ -115,6 +115,7 @@ class SafetyNode(Node):
 
         self.external_stop_requested = False
         self.external_speed_limit = None  # None = no limit
+        self.stoplight_red = False
 
         self.current_zone = SafetyZone.CLEAR
         self.closest_obstacle_dist = float('inf')
@@ -136,6 +137,7 @@ class SafetyNode(Node):
             AckermannDriveStamped, "/vesc/high_level/input/nav_0",
             self.nav_callback, 10
         )
+        self.create_subscription(String, "/stoplight/result", self.stoplight_callback, 10)
 
         # ===== Timers =====
         self.create_timer(0.1, self.check_laser_timeout)
@@ -311,6 +313,12 @@ class SafetyNode(Node):
         if msg.data:
             self.get_logger().warn('\033[95mExternal stop requested\033[0m')
 
+    def stoplight_callback(self, msg: String):
+        was_red = self.stoplight_red
+        self.stoplight_red = (msg.data == "red")
+        if self.stoplight_red and not was_red:
+            self.get_logger().error('\033[91;1m[STOPLIGHT] RED — CRITICAL stop, no turn\033[0m')
+
     def speed_limit_callback(self, msg: Float32):
         if not self.respect_external_speed:
             return
@@ -359,6 +367,11 @@ class SafetyNode(Node):
         if self.external_stop_requested:
             self.current_zone = SafetyZone.CRITICAL
             self.send_stop_command()
+            return
+
+        if self.stoplight_red:
+            self.current_zone = SafetyZone.CRITICAL
+            self.send_stop_command(0.0)
             return
 
         ranges = np.array(msg.ranges)
