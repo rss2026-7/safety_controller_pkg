@@ -11,8 +11,11 @@ Key features:
   2. Dynamic cone angle that narrows at high speed
   3. Steering-aware obstacle weighting (feature-flagged)
   4. Direction-aware scanning (forward/reverse, feature-flagged)
-  5. Graduated response zones: CLEAR / CAUTION / AVOIDANCE / CRITICAL
+  5. Graduated response zones: CLEAR / CAUTION / CRITICAL
   6. External override interface for perception integration (feature-flagged)
+
+Safety only modifies SPEED. Steering is passed through unchanged from
+the nav command on every published frame.
 """
 
 import math
@@ -34,8 +37,7 @@ class SafetyZone:
     """Safety zone classification for graduated response."""
     CLEAR = 0      # No action; nav has full control
     CAUTION = 1    # Speed scaled down linearly
-    AVOIDANCE = 2  # Speed-limited and actively steering away
-    CRITICAL = 3   # Already too close, hard brake
+    CRITICAL = 2   # Already too close, hard brake
 
 
 class SafetyNode(Node):
@@ -86,22 +88,9 @@ class SafetyNode(Node):
         self.caution_multiplier   = self._req('caution.distance_multiplier')
         self.caution_start_factor = self._req('caution.start_factor')
         self.caution_end_factor   = self._req('caution.end_factor')
-        self.caution_escalate     = self._req('caution.escalate_below_factor')
 
-        self.avoidance_enabled       = self._req('avoidance.enabled')
-        self.avoidance_max_steering  = self._req('avoidance.max_steering_angle')
-        head_on = self._req('avoidance.head_on_direction')
-        if head_on not in ('left', 'right'):
-            raise ValueError(
-                f"avoidance.head_on_direction must be 'left' or 'right', got {head_on!r}"
-            )
-        # Steering convention: positive = left turn.
-        self.head_on_sign = 1.0 if head_on == 'left' else -1.0
-
-        self.min_distance          = self._req('critical.min_distance')
-        self.brake_speed           = self._req('critical.brake_speed')
-        self.critical_steer_away   = self._req('critical.steer_away')
-        self.critical_max_steering = self._req('critical.max_steering_angle')
+        self.min_distance = self._req('critical.min_distance')
+        self.brake_speed  = self._req('critical.brake_speed')
 
         self.person_critical_enabled  = self._req('person_critical.enabled')
         self.person_image_width       = self._req('person_critical.image_width')
@@ -465,24 +454,15 @@ class SafetyNode(Node):
         # ─── CRITICAL ─── inside stopping distance: hard brake.
         if min_actual_dist < stopping_dist:
             self.current_zone = SafetyZone.CRITICAL
-            if self.critical_steer_away:
-                avoidance = self.compute_avoidance_steering(self.critical_max_steering)
-                self.get_logger().error(
-                    f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
-                    f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
-                    f'speed {self.current_speed:.2f} m/s) — STOP, steer {math.degrees(avoidance):+.0f}°\033[0m'
-                )
-                self.send_stop_command(avoidance)
-            else:
-                self.get_logger().error(
-                    f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
-                    f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
-                    f'speed {self.current_speed:.2f} m/s) — STOP\033[0m'
-                )
-                self.send_stop_command()
+            self.get_logger().error(
+                f'\033[91;1m[CRITICAL] Obstacle at {min_actual_dist:.2f}m, bearing '
+                f'{math.degrees(min_angle):+.0f}° (threshold {stopping_dist:.2f}m, '
+                f'speed {self.current_speed:.2f} m/s) — STOP\033[0m'
+            )
+            self.send_stop_command()
             return
 
-        # ─── CAUTION / AVOIDANCE ─── speed-scale within caution range.
+        # ─── CAUTION ─── speed-scale within caution range.
         if min_effective_dist < caution_dist:
             span = max(1e-6, caution_dist - stopping_dist)
             progress = (caution_dist - min_effective_dist) / span
@@ -495,23 +475,13 @@ class SafetyNode(Node):
             if self.external_speed_limit is not None:
                 max_allowed_speed = min(max_allowed_speed, self.external_speed_limit)
 
-            if factor < self.caution_escalate and self.avoidance_enabled:
-                self.current_zone = SafetyZone.AVOIDANCE
-                avoidance = self.compute_avoidance_steering(self.avoidance_max_steering)
-                self.get_logger().warn(
-                    f'\033[95m[AVOIDANCE] Obstacle at {min_actual_dist:.2f}m, bearing '
-                    f'{math.degrees(min_angle):+.0f}° — limiting to {max_allowed_speed:.2f} m/s, '
-                    f'steer {math.degrees(avoidance):+.0f}°\033[0m'
+            self.current_zone = SafetyZone.CAUTION
+            if self.current_nav_speed > max_allowed_speed + 0.05:
+                self.get_logger().info(
+                    f'\033[93m[CAUTION] Obstacle at {min_actual_dist:.2f}m — '
+                    f'limiting {self.current_nav_speed:.2f}→{max_allowed_speed:.2f} m/s\033[0m'
                 )
-                self.send_speed_limit_command(max_allowed_speed, avoidance)
-            else:
-                self.current_zone = SafetyZone.CAUTION
-                if self.current_nav_speed > max_allowed_speed + 0.05:
-                    self.get_logger().info(
-                        f'\033[93m[CAUTION] Obstacle at {min_actual_dist:.2f}m — '
-                        f'limiting {self.current_nav_speed:.2f}→{max_allowed_speed:.2f} m/s\033[0m'
-                    )
-                self.send_speed_limit_command(max_allowed_speed)
+            self.send_speed_limit_command(max_allowed_speed)
             return
 
         # ─── CLEAR ─── nothing in range.
@@ -524,42 +494,30 @@ class SafetyNode(Node):
     # COMMAND PUBLISHING
     # =========================================================================
 
-    def compute_avoidance_steering(self, max_angle: float) -> float:
-        """Steering angle that nudges the car away from the closest obstacle.
+    def send_stop_command(self):
+        """Hard-brake command. Targets ``critical.brake_speed``.
 
-        ``max_angle`` is the cap (radians); the sign is opposite the
-        obstacle's bearing so the front turns away. For dead-center
-        obstacles the configured ``head_on_direction`` breaks the tie. In
-        reverse the rear-edge rays don't map cleanly to a steer direction,
-        so we return the held nav steering unchanged.
+        Steering is passed through unchanged from the latest nav command —
+        safety only modifies speed.
         """
-        if self.current_speed < -0.1:
-            return self.current_steering
-
-        angle = self.closest_obstacle_angle
-        if abs(angle) < 0.05:
-            direction = self.head_on_sign
-        else:
-            direction = -1.0 if angle > 0 else 1.0
-        return direction * max_angle
-
-    def send_stop_command(self, steering: float | None = None):
-        """Hard-brake command. Targets ``critical.brake_speed``."""
         stop = AckermannDriveStamped()
         stop.header.stamp = self.get_clock().now().to_msg()
         stop.header.frame_id = "base_link"
         stop.drive.speed = self.brake_speed
         stop.drive.acceleration = -self.brake_accel
-        stop.drive.steering_angle = self.current_steering if steering is None else steering
+        stop.drive.steering_angle = self.current_steering
         self.safety_pub.publish(stop)
 
-    def send_speed_limit_command(self, max_speed: float, steering: float | None = None):
-        """Speed-cap command for graduated response."""
+    def send_speed_limit_command(self, max_speed: float):
+        """Speed-cap command for graduated response.
+
+        Steering is passed through unchanged from the latest nav command.
+        """
         cmd = AckermannDriveStamped()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.header.frame_id = "base_link"
         cmd.drive.speed = max_speed
-        cmd.drive.steering_angle = self.current_steering if steering is None else steering
+        cmd.drive.steering_angle = self.current_steering
         self.safety_pub.publish(cmd)
 
     def publish_status(self):

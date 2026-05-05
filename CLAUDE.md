@@ -23,8 +23,11 @@ is missing. To change behavior, edit the YAML and rebuild (or pass an
 override path via the `config:=` launch arg).
 
 Top-level sections: `cone`, `vehicle`, `physics`, `features`, `caution`,
-`avoidance`, `critical`, `person_critical`, `laser_timeout`. See the YAML's
-inline comments for the meaning and units of every key.
+`critical`, `person_critical`, `laser_timeout`. See the YAML's inline
+comments for the meaning and units of every key.
+
+Safety only modifies SPEED. Steering is passed through unchanged from the
+latest nav command on every published frame.
 
 ## Architecture
 
@@ -33,7 +36,7 @@ ROS 2 Python package for MIT RACECAR safety. Designed for **Final Challenge 2026
 ### Key Features
 - **Velocity-dependent stopping distance**: `d = v²/(2a) + margin`
 - **Dynamic cone angle**: narrows at high speed to avoid adjacent-lane false triggers
-- **Graduated response zones**: CLEAR → CAUTION → AVOIDANCE → CRITICAL
+- **Graduated response zones**: CLEAR → CAUTION → CRITICAL
 - **External override interface**: `/safety/external_stop` and `/safety/max_speed`
 - **Feature flags** (in `config/safety.yaml`): toggle external-override handling,
   steering-aware detection, and reverse-direction scanning
@@ -60,4 +63,4 @@ On every commit:
    git tag -a v2.1.0 -m "Release v2.1.0"
    ```
 
-Current version: **2.5.0**
+Current version: **2.5.1**

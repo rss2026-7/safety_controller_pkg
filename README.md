@@ -39,9 +39,11 @@ Top-level sections:
 | `physics` | Brake deceleration, reaction time, safety buffer |
 | `features` | Toggle external overrides, steering-aware detection, reverse scanning |
 | `caution` | CAUTION zone bounds and speed-scaling factors |
-| `avoidance` | AVOIDANCE-zone steering behavior |
 | `critical` | CRITICAL-zone hard-brake behavior |
 | `laser_timeout` | Watchdog (emergency stop if `/scan` stops arriving) |
+
+> **Safety only modifies speed.** Steering is passed through unchanged from
+> the latest nav command on every published frame.
 
 ---
 
@@ -89,8 +91,7 @@ adjacent lanes during curves).
 |------|----------|--------|
 | **CLEAR** | > `caution.distance_multiplier` × stopping_dist | No intervention; nav passes through |
 | **CAUTION** | between stopping_dist and the outer caution edge | Nav speed scaled down linearly (`start_factor` → `end_factor`) |
-| **AVOIDANCE** | within CAUTION when factor drops below `escalate_below_factor` | Speed-limited AND actively steering away from the obstacle |
-| **CRITICAL** | < stopping_dist | Hard brake at `physics.brake_accel`; steers away if `critical.steer_away` |
+| **CRITICAL** | < stopping_dist | Hard brake at `physics.brake_accel` |
 
 ---
 
@@ -150,7 +151,7 @@ External overrides are gated by `features.respect_external_stop` and
 | Topic | Type | Description |
 |-------|------|-------------|
 | `/vesc/low_level/input/safety` | `ackermann_msgs/AckermannDriveStamped` | Stop / speed-limit commands |
-| `/safety/status` | `std_msgs/Float32` | Current zone (0=CLEAR, 1=CAUTION, 2=AVOIDANCE, 3=CRITICAL) |
+| `/safety/status` | `std_msgs/Float32` | Current zone (0=CLEAR, 1=CAUTION, 2=CRITICAL) |
 
 ---
 
@@ -162,7 +163,6 @@ Make a race-profile YAML (copy `safety.yaml` and tune):
 - Disable `respect_external_stop` and `respect_external_speed`
 - Enable `steering_aware_detection`
 - Narrow the cone (`min_angle` lower, `shrink_speed` lower)
-- Optionally disable `avoidance.enabled` (weaving adds risk at speed)
 
 ```bash
 ros2 launch safety_controller_pkg safety.launch.py config:=/abs/path/to/race.yaml
