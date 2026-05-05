@@ -494,8 +494,10 @@ class SafetyNode(Node):
     # COMMAND PUBLISHING
     # =========================================================================
 
-    def send_stop_command(self):
-        """Hard-brake command. Targets ``critical.brake_speed``.
+    def send_stop_command(self, speed: float = None):
+        """Hard-brake command. Targets ``critical.brake_speed`` by default,
+        or ``speed`` when an explicit override is supplied (used by the
+        stoplight and person-too-close paths to force a clean 0 m/s).
 
         Steering is passed through unchanged from the latest nav command —
         safety only modifies speed.
@@ -503,7 +505,7 @@ class SafetyNode(Node):
         stop = AckermannDriveStamped()
         stop.header.stamp = self.get_clock().now().to_msg()
         stop.header.frame_id = "base_link"
-        stop.drive.speed = self.brake_speed
+        stop.drive.speed = self.brake_speed if speed is None else speed
         stop.drive.acceleration = -self.brake_accel
         stop.drive.steering_angle = self.current_steering
         self.safety_pub.publish(stop)
