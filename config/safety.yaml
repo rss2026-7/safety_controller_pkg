@@ -96,6 +96,17 @@ safety_node:
       min_distance: 0.2            # m, floor on stopping distance
       brake_speed:  0.0            # m/s, target speed during stop
 
+    # ─── Stoplight latch ────────────────────────────────────────────────
+    # Once "red" is observed on /stoplight/result, hold the CRITICAL stop
+    # for at least latch_sec seconds. Each fresh "red" message extends the
+    # latch; "green" or "none" do not clear it — only the timer expiring
+    # does. Bridges YOLO drop-outs and per-frame "none" gaps so a brief
+    # red flicker actually translates into a sustained brake. Tune up
+    # (3-5s) to honour the 5-second-stop intersection rule with margin;
+    # tune down (1s) if you want green-light starts to be snappier.
+    stoplight:
+      latch_sec: 2.0
+
     # ─── Person-detection critical stop (YOLO) ──────────────────────────
     # Subscribes to /yolo/person/roi (sensor_msgs/RegionOfInterest) from
     # final_challenge's yolo_node. When the detected bbox area exceeds

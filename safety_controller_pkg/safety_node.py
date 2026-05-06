@@ -23,7 +23,11 @@ import os
 import yaml
 
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 import numpy as np
 from ament_index_python.packages import get_package_share_directory
 
@@ -101,6 +105,8 @@ class SafetyNode(Node):
             * self.person_area_fraction
         )
 
+        self.stoplight_latch_sec = self._req('stoplight.latch_sec')
+
         self.laser_timeout = self._req('laser_timeout')
 
         # ===== State variables =====
@@ -113,7 +119,13 @@ class SafetyNode(Node):
 
         self.external_stop_requested = False
         self.external_speed_limit = None  # None = no limit
+        # Latched red-light state: each "red" extends `_stoplight_red_until`
+        # by `stoplight_latch_sec`; the safety decision reads the latch via
+        # `_stoplight_red_active()`, never `self.stoplight_red` directly.
+        # Without the latch a single intervening "none" between two
+        # scan_callback ticks would un-stop the car at a real red light.
         self.stoplight_red = False
+        self._stoplight_red_until = None
         self.person_too_close = False
         self.person_last_area_px = 0
 
@@ -128,19 +140,40 @@ class SafetyNode(Node):
         self.status_pub = self.create_publisher(Float32, "/safety/status", 10)
 
         # ===== Subscribers =====
-        self.create_subscription(LaserScan, "/scan", self.scan_callback, 10)
-        self.create_subscription(Odometry, "/odom", self.odom_callback, 10)
-        self.create_subscription(Odometry, "/vesc/odom", self.odom_callback, 10)
-        self.create_subscription(Bool, "/safety/external_stop", self.external_stop_callback, 10)
-        self.create_subscription(Float32, "/safety/max_speed", self.speed_limit_callback, 10)
+        # Run every callback in a ReentrantCallbackGroup so that a slow
+        # perception callback (YOLO/HSV) can never starve scan_callback
+        # — that starvation was the architectural reason brief "red"
+        # detections sometimes failed to trigger a stop. Pair with the
+        # MultiThreadedExecutor in main(). Sensor topics use sensor_data
+        # QoS (BEST_EFFORT, depth 1) to match real publishers and avoid
+        # silent drops behind a backed-up reliable queue.
+        cb_group = ReentrantCallbackGroup()
+        self.create_subscription(
+            LaserScan, "/scan", self.scan_callback,
+            qos_profile_sensor_data, callback_group=cb_group)
+        self.create_subscription(
+            Odometry, "/odom", self.odom_callback,
+            qos_profile_sensor_data, callback_group=cb_group)
+        self.create_subscription(
+            Odometry, "/vesc/odom", self.odom_callback,
+            qos_profile_sensor_data, callback_group=cb_group)
+        self.create_subscription(
+            Bool, "/safety/external_stop", self.external_stop_callback,
+            10, callback_group=cb_group)
+        self.create_subscription(
+            Float32, "/safety/max_speed", self.speed_limit_callback,
+            10, callback_group=cb_group)
         self.create_subscription(
             AckermannDriveStamped, "/vesc/high_level/input/nav_0",
-            self.nav_callback, 10
-        )
-        self.create_subscription(String, "/stoplight/result", self.stoplight_callback, 10)
+            self.nav_callback,
+            qos_profile_sensor_data, callback_group=cb_group)
+        self.create_subscription(
+            String, "/stoplight/result", self.stoplight_callback,
+            10, callback_group=cb_group)
         if self.person_critical_enabled:
             self.create_subscription(
-                RegionOfInterest, "/yolo/person/roi", self.person_roi_callback, 10
+                RegionOfInterest, "/yolo/person/roi", self.person_roi_callback,
+                qos_profile_sensor_data, callback_group=cb_group,
             )
 
         # ===== Timers =====
@@ -336,10 +369,41 @@ class SafetyNode(Node):
             )
 
     def stoplight_callback(self, msg: String):
-        was_red = self.stoplight_red
-        self.stoplight_red = (msg.data == "red")
-        if self.stoplight_red and not was_red:
-            self.get_logger().error('\033[91;1m[STOPLIGHT] RED — CRITICAL stop, no turn\033[0m')
+        """Latch on "red"; ignore "green"/"none" until the latch expires.
+
+        Each fresh "red" extends `_stoplight_red_until` by latch_sec — so
+        as long as red is detected at least once per latch window, the
+        stop holds. The latch only clears when `_stoplight_red_active()`
+        is checked AFTER expiry (in scan_callback), so a single dropped
+        frame between two scan ticks can no longer un-stop the car.
+        """
+        if msg.data == "red":
+            was_active = self._stoplight_red_active()
+            self.stoplight_red = True
+            self._stoplight_red_until = (
+                self.get_clock().now()
+                + Duration(seconds=self.stoplight_latch_sec)
+            )
+            if not was_active:
+                self.get_logger().error(
+                    '\033[91;1m[STOPLIGHT] RED — CRITICAL stop, '
+                    f'latched for {self.stoplight_latch_sec:.1f}s\033[0m'
+                )
+
+    def _stoplight_red_active(self) -> bool:
+        """True iff a "red" message arrived within the last latch window.
+        Lazily clears the latch on expiry — there is no separate timer."""
+        if not self.stoplight_red:
+            return False
+        if (self._stoplight_red_until is None
+                or self.get_clock().now() >= self._stoplight_red_until):
+            self.stoplight_red = False
+            self._stoplight_red_until = None
+            self.get_logger().info(
+                '\033[92m[STOPLIGHT] latch expired — clearing\033[0m'
+            )
+            return False
+        return True
 
     def speed_limit_callback(self, msg: Float32):
         if not self.respect_external_speed:
@@ -391,7 +455,7 @@ class SafetyNode(Node):
             self.send_stop_command()
             return
 
-        if self.stoplight_red:
+        if self._stoplight_red_active():
             self.current_zone = SafetyZone.CRITICAL
             self.send_stop_command(0.0)
             return
@@ -547,8 +611,20 @@ class SafetyNode(Node):
 def main():
     rclpy.init()
     node = SafetyNode()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    # MultiThreadedExecutor + ReentrantCallbackGroup lets scan_callback
+    # run concurrently with the perception callbacks (stoplight, person,
+    # external_stop) — single-threaded spin() serialised them, which is
+    # what could delay a brake decision behind a slow perception update.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
