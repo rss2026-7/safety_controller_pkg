@@ -369,7 +369,7 @@ class SafetyNode(Node):
             )
 
     def stoplight_callback(self, msg: String):
-        """Latch on "red"; ignore "green"/"none" until the latch expires.
+        """Latch on "red"; ignore "none" until the latch expires.
 
         Each fresh "red" extends `_stoplight_red_until` by latch_sec — so
         as long as red is detected at least once per latch window, the
